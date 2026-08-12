@@ -23,14 +23,17 @@ get-childitem c:\scripts\dc_actions -recurse | unblock-file
 Copy-Item \\dc-nnn.nnn.lo\c$\gpo-export\nnn.xml C:\gpo-export\
 Copy-Item \\dc-nnn.nnn.lo\c$\gpo-export\nnn.html C:\gpo-export\
 copy-item \\dc-nnn.nnn.lo\c$\gpo-export\2026-08-12 c:\gpo-export\ -recurse
+copy-item \\dc-nnn.nnn.lo\c$\ad-export\* c:\ad-export\ -recurse
 ########################################################################
 
 #По другим доменам — с параметрами:
 .\Export-GpoMap.ps1 -Domain kkk.lo -Server dc-kkk.kkk.lo
 .\Export-GpoReport.ps1 -Domain kkk.lo -Server dc-kkk.kkk.lo
+.\run-adhealth.ps1
+.\run-adhealth.ps1 -domain kkk.lo -server dc-iiii.kkk.lo
 ########################################################################
 
-#Execute Scripts
+#Сделать скрипты выполняемыми
 Get-ChildItem . -Filter *.ps1 | Unblock-File
 ########################################################################
 
