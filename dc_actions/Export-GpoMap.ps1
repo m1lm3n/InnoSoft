@@ -1,46 +1,103 @@
 <#
-    Export-GpoMap.ps1
+    Export-GpoMap.ps1  -  COLLECTION ONLY
 
-    Exports a GPO map for a domain: OU structure, policy links,
-    WMI filters and an inventory of the policies themselves.
+    Reads GPO data from a domain and writes it to CSV files.
+    Does no analysis: run Analyze-GpoMap.ps1 against the output folder.
+
+    Produces:
+        <domain>-ou.csv             OU structure
+        <domain>-links.csv          GPO links per container
+        <domain>-wmi.csv            WMI filters
+        <domain>-gpo.csv            GPO inventory
+        <domain>-permissions.csv    Get-GPPermission view of every GPO ACL
+        <domain>-applyaces.csv      raw Apply-Group-Policy ACEs, Allow AND Deny
+        <domain>-groupmembers.csv   members of every group seen in an Apply ACE
+        <domain>-meta.csv           run metadata, including completeness flag
+
+    Why applyaces.csv exists:
+        Get-GPPermission collapses non-standard ACLs into "GpoCustom" and
+        cannot tell Allow from Deny. Exclusion groups are usually implemented
+        as a Deny on Apply Group Policy, so the raw DACL is read separately.
 
     Notes:
       - Does NOT require WinRM (no Invoke-Command)
-      - Does NOT require the ActiveDirectory module (OUs are read via ADSI)
-      - Works from a window started with runas /netonly
+      - Does NOT require the ActiveDirectory module (ADSI only)
+      - Works from a window started with runas /netonly.
+        Open a FRESH window before a long run: an expiring Kerberos ticket
+        is the usual cause of partial collections.
 
     Usage:
         .\Export-GpoMap.ps1
         .\Export-GpoMap.ps1 -Domain kkk.lo -Server dc-iiii.kkk.lo
+        .\Export-GpoMap.ps1 -dated
+        .\Export-GpoMap.ps1 -outdir c:\gpo-export -dated
+
+    The -dated switch creates a yyyy-MM-dd subfolder by itself, so no date
+    format has to be typed on the command line.
 #>
 
 [CmdletBinding()]
 param(
     [string]$Domain = 'nnn.lo',
     [string]$Server = 'dc-nnn.nnn.lo',
-    [string]$OutDir = 'C:\gpo-export'
+    [string]$OutDir = 'C:\gpo-export',
+
+    [int]$MaxGroupMembers = 500,
+    [int]$Retries = 3,
+
+    # Append a yyyy-MM-dd subfolder to OutDir automatically.
+    # Saves typing a date format on a keyboard without Shift.
+    [switch]$Dated,
+
+    # Fail loudly instead of writing an incomplete data set
+    [switch]$FailOnIncomplete,
+
+    [switch]$NoZip
 )
 
 $ErrorActionPreference = 'Stop'
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
+$startedAt = Get-Date
+
+# Extended right "Apply Group Policy"
+$APPLY_GP_GUID = [guid]'edacfd8f-ffb3-11d1-b41d-00a0c968f939'
+
 Import-Module GroupPolicy
+
+if ($Dated) {
+    $OutDir = Join-Path $OutDir (Get-Date).ToString('yyyy-MM-dd')
+}
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
-Write-Host "`n=== $Domain via $Server ===" -ForegroundColor Cyan
+Write-Host "`n=== GPO collection: $Domain via $Server ===" -ForegroundColor Cyan
+Write-Host ("Started: {0:yyyy-MM-dd HH:mm:ss}" -f $startedAt) -ForegroundColor DarkGray
+Write-Host "Output:  $OutDir" -ForegroundColor DarkGray
 
 # ---------------------------------------------------------------
-# Helper: directory search via ADSI
+# Helpers
 # ---------------------------------------------------------------
+function Invoke-WithRetry {
+    param([scriptblock]$Script, [string]$What = 'operation', [int]$Attempts = $Retries)
+    for ($a = 1; $a -le $Attempts; $a++) {
+        try { return & $Script }
+        catch {
+            if ($a -eq $Attempts) {
+                Write-Warning "FAILED after $a attempts - ${What}: $($_.Exception.Message)"
+                throw
+            }
+            Write-Host "    retry $a/$Attempts - $What" -ForegroundColor DarkYellow
+            Start-Sleep -Milliseconds (800 * $a)
+        }
+    }
+}
+
 function Search-Directory {
-    param(
-        [string]$Base,
-        [string]$Filter,
-        [string[]]$Properties
-    )
+    param([string]$Base, [string]$Filter, [string[]]$Properties, [switch]$WithDacl)
     $s = New-Object System.DirectoryServices.DirectorySearcher
     $s.SearchRoot = [ADSI]"LDAP://$Server/$Base"
     $s.Filter = $Filter
     $s.PageSize = 1000
+    if ($WithDacl) { $s.SecurityMasks = [System.DirectoryServices.SecurityMasks]::Dacl }
     foreach ($p in $Properties) { [void]$s.PropertiesToLoad.Add($p) }
     $s.FindAll()
 }
@@ -53,21 +110,86 @@ function Get-Prop {
 $script:StepMarks = New-Object System.Collections.Generic.List[object]
 function Write-Step {
     param([string]$Label)
+    # close out the previous step with its duration
+    if ($script:StepMarks.Count) {
+        $last = $script:StepMarks[$script:StepMarks.Count - 1]
+        Write-Host ("      took {0:mm\:ss}" -f ($sw.Elapsed - $last.At)) -ForegroundColor DarkGray
+    }
     $script:StepMarks.Add([PSCustomObject]@{ Label = $Label; At = $sw.Elapsed })
-    Write-Host ("`n{0}  [{1:mm\:ss}]" -f $Label, $sw.Elapsed) -ForegroundColor Yellow
+    Write-Host ("`n{0}   (elapsed so far {1:mm\:ss})" -f $Label, $sw.Elapsed) -ForegroundColor Yellow
+}
+
+function Complete-LastStep {
+    if ($script:StepMarks.Count) {
+        $last = $script:StepMarks[$script:StepMarks.Count - 1]
+        Write-Host ("      took {0:mm\:ss}" -f ($sw.Elapsed - $last.At)) -ForegroundColor DarkGray
+    }
+}
+
+function Out-Table {
+    param($Data, [string]$Suffix)
+    $path = Join-Path $OutDir "$Domain-$Suffix.csv"
+    $Data | Export-Csv $path -NoTypeInformation -Encoding UTF8
+    return $path
+}
+
+function ConvertTo-ByteArray {
+    # The leading comma is essential: without it PowerShell unrolls the
+    # array on output and the caller gets Object[] instead of byte[].
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [byte[]]) { return , $Value }
+    $arr = New-Object byte[] $Value.Count
+    for ($z = 0; $z -lt $Value.Count; $z++) { $arr[$z] = [byte]$Value[$z] }
+    return , $arr
+}
+
+# SID -> name cache, filled as we go
+$script:SidNames = @{}
+function Resolve-Sid {
+    param([string]$Sid)
+    if ($script:SidNames.ContainsKey($Sid)) { return $script:SidNames[$Sid] }
+    $name = $null
+    try {
+        $o = [ADSI]"LDAP://$Server/<SID=$Sid>"
+        $name = @($o.Properties['sAMAccountName'])[0]
+        if (-not $name) { $name = @($o.Properties['name'])[0] }
+    }
+    catch { $name = $null }
+    if (-not $name) {
+        try { $name = (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value }
+        catch { $name = $null }
+    }
+    $script:SidNames[$Sid] = $name
+    return $name
 }
 
 # ---------------------------------------------------------------
-# 1. Domain root
+# Domain root and domain SID
 # ---------------------------------------------------------------
 $rootDse = [ADSI]"LDAP://$Server/RootDSE"
 $baseDn = $rootDse.defaultNamingContext[0]
-Write-Host "Base DN: $baseDn"
+
+$domSid = $null
+try {
+    $domEntry = [ADSI]"LDAP://$Server/$baseDn"
+    $sidBytes = ConvertTo-ByteArray $domEntry.Properties['objectSid'][0]
+    # ::new() takes the byte[] as a single argument; New-Object -ArgumentList
+    # would splat the array into separate constructor parameters.
+    $domSid = [System.Security.Principal.SecurityIdentifier]::new($sidBytes, 0).Value
+}
+catch {
+    Write-Warning "Could not read domain SID directly: $($_.Exception.Message)"
+    Write-Warning "Will derive it from collected ACLs instead."
+}
+
+Write-Host "Base DN:    $baseDn" -ForegroundColor DarkGray
+Write-Host "Domain SID: $domSid" -ForegroundColor DarkGray
 
 # ---------------------------------------------------------------
-# 2. OU structure
+# 1. OU structure
 # ---------------------------------------------------------------
-Write-Step "[1/5] OU structure..."
+Write-Step "[1/7] OU structure"
 
 $ouResults = Search-Directory -Base $baseDn `
     -Filter '(objectClass=organizationalUnit)' `
@@ -82,25 +204,34 @@ $ous = foreach ($r in $ouResults) {
         Depth             = ([regex]::Matches((Get-Prop $r 'distinguishedname'), 'OU=')).Count
     }
 }
-
 $ous = $ous | Sort-Object DistinguishedName
-$ous | Export-Csv (Join-Path $OutDir "$Domain-ou.csv") -NoTypeInformation -Encoding UTF8
-Write-Host "  OUs found: $(@($ous).Count)"
+[void](Out-Table $ous 'ou')
+Write-Host "  OUs: $(@($ous).Count)"
 
 # ---------------------------------------------------------------
-# 3. Policy links: domain root + every OU
+# 2. Policy links
 # ---------------------------------------------------------------
-Write-Step "[2/5] Policy links..."
+Write-Step "[2/7] Policy links"
 
 $targets = @($baseDn) + @($ous.DistinguishedName)
 $links = New-Object System.Collections.Generic.List[object]
+$linkFailures = New-Object System.Collections.Generic.List[string]
 $i = 0
 
 foreach ($t in $targets) {
     $i++
     Write-Progress -Activity 'Reading links' -Status $t -PercentComplete ($i * 100 / $targets.Count)
     try {
-        $inh = Get-GPInheritance -Target $t -Domain $Domain -Server $Server
+        $inh = Invoke-WithRetry -What "links on $t" -Script {
+            Get-GPInheritance -Target $t -Domain $Domain -Server $Server
+        }
+        if ($inh.GpoLinks.Count -eq 0) {
+            $links.Add([PSCustomObject]@{
+                    Target = $t; InheritBlocked = $inh.GpoInheritanceBlocked
+                    Order = $null; DisplayName = $null; Enabled = $null
+                    Enforced = $null; GpoId = $null
+                })
+        }
         foreach ($l in $inh.GpoLinks) {
             $links.Add([PSCustomObject]@{
                     Target         = $t
@@ -113,42 +244,33 @@ foreach ($t in $targets) {
                 })
         }
     }
-    catch {
-        Write-Warning "$t : $($_.Exception.Message)"
-    }
+    catch { $linkFailures.Add($t) }
 }
 Write-Progress -Activity 'Reading links' -Completed
-
-$links | Export-Csv (Join-Path $OutDir "$Domain-links.csv") -NoTypeInformation -Encoding UTF8
-Write-Host "  links found: $($links.Count)"
+[void](Out-Table $links 'links')
+Write-Host "  link records: $($links.Count), failed containers: $($linkFailures.Count)"
 
 # ---------------------------------------------------------------
-# 4. WMI filters
+# 3. WMI filters
 # ---------------------------------------------------------------
-Write-Step "[3/5] WMI filters..."
+Write-Step "[3/7] WMI filters"
 
+$wmi = @()
 try {
     $wmiResults = Search-Directory -Base "CN=SOM,CN=WMIPolicy,CN=System,$baseDn" `
-        -Filter '(objectClass=msWMI-Som)' `
-        -Properties 'mswmi-name', 'mswmi-parm2'
-
+        -Filter '(objectClass=msWMI-Som)' -Properties 'mswmi-name', 'mswmi-parm2'
     $wmi = foreach ($r in $wmiResults) {
-        [PSCustomObject]@{
-            Name  = Get-Prop $r 'mswmi-name'
-            Query = Get-Prop $r 'mswmi-parm2'
-        }
+        [PSCustomObject]@{ Name = Get-Prop $r 'mswmi-name'; Query = Get-Prop $r 'mswmi-parm2' }
     }
-    $wmi | Export-Csv (Join-Path $OutDir "$Domain-wmi.csv") -NoTypeInformation -Encoding UTF8
-    Write-Host "  filters found: $(@($wmi).Count)"
+    [void](Out-Table $wmi 'wmi')
+    Write-Host "  filters: $(@($wmi).Count)"
 }
-catch {
-    Write-Warning "WMI filters: $($_.Exception.Message)"
-}
+catch { Write-Warning "WMI filters: $($_.Exception.Message)" }
 
 # ---------------------------------------------------------------
-# 5. GPO inventory
+# 4. GPO inventory
 # ---------------------------------------------------------------
-Write-Step "[4/5] GPO inventory..."
+Write-Step "[4/7] GPO inventory"
 
 $gpos = Get-GPO -All -Domain $Domain -Server $Server |
 Select-Object DisplayName, Id, GpoStatus, CreationTime, ModificationTime,
@@ -159,173 +281,278 @@ Select-Object DisplayName, Id, GpoStatus, CreationTime, ModificationTime,
 @{N = 'ComputerVersionSysvol'; E = { $_.Computer.SysvolVersion } },
 @{N = 'WmiFilter'; E = { $_.WmiFilter.Name } }
 
-$gpos | Export-Csv (Join-Path $OutDir "$Domain-gpo.csv") -NoTypeInformation -Encoding UTF8
-Write-Host "  policies found: $(@($gpos).Count)"
+[void](Out-Table $gpos 'gpo')
+Write-Host "  policies: $(@($gpos).Count)"
 
 # ---------------------------------------------------------------
-# 6. Summary
+# 5. Permissions, with retry and a completeness pass
 # ---------------------------------------------------------------
-$linkedIds = $links.GpoId | Sort-Object -Unique
-$orphans = $gpos | Where-Object { $_.Id -notin $linkedIds }
-$empty = $gpos | Where-Object { $_.UserVersionAD -eq 0 -and $_.ComputerVersionAD -eq 0 }
-$mismatch = $gpos | Where-Object {
-    $_.UserVersionAD -ne $_.UserVersionSysvol -or
-    $_.ComputerVersionAD -ne $_.ComputerVersionSysvol
-}
-
-Write-Host "`n--- Summary ---" -ForegroundColor Cyan
-Write-Host "Total policies:           $(@($gpos).Count)"
-Write-Host "Not linked anywhere:      $(@($orphans).Count)"
-Write-Host "Empty (both versions 0):  $(@($empty).Count)"
-Write-Host "AD / SYSVOL mismatch:     $(@($mismatch).Count)"
-
-if ($orphans) {
-    Write-Host "`nNot linked:" -ForegroundColor DarkYellow
-    $orphans  | ForEach-Object { "  $($_.DisplayName)" }
-}
-if ($empty) {
-    Write-Host "`nEmpty:" -ForegroundColor DarkYellow
-    $empty    | ForEach-Object { "  $($_.DisplayName)" }
-}
-if ($mismatch) {
-    Write-Host "`nVersion mismatch (SYSVOL replication problem):" -ForegroundColor Red
-    $mismatch | ForEach-Object { "  $($_.DisplayName)" }
-}
-
-# ---------------------------------------------------------------
-# 7. Security filtering (who actually gets each policy)
-# ---------------------------------------------------------------
-Write-Step "[5/5] Security filtering..."
-
-$AUTH_USERS_SID = 'S-1-5-11'   # Authenticated Users
-$DOM_COMPUTERS = '-515'       # Domain Computers (RID suffix)
+Write-Step "[5/7] Permissions"
 
 $perms = New-Object System.Collections.Generic.List[object]
-$j = 0
+$permFailures = New-Object System.Collections.Generic.List[string]
 
+function Read-GpoPermissions {
+    param($Gpo)
+    $rows = Invoke-WithRetry -What "permissions on $($Gpo.DisplayName)" -Script {
+        Get-GPPermission -Guid $Gpo.Id -Domain $Domain -Server $Server -All
+    }
+    foreach ($p in $rows) {
+        $perms.Add([PSCustomObject]@{
+                Gpo        = $Gpo.DisplayName
+                GpoId      = $Gpo.Id
+                Trustee    = $p.Trustee.Name
+                TrusteeSid = $p.Trustee.Sid.Value
+                SidType    = $p.Trustee.SidType
+                Permission = $p.Permission
+                Inherited  = $p.Inherited
+                Applies    = ($p.Permission -match 'Apply')
+            })
+    }
+}
+
+$j = 0
 foreach ($g in $gpos) {
     $j++
     Write-Progress -Activity 'Reading permissions' -Status $g.DisplayName -PercentComplete ($j * 100 / @($gpos).Count)
-    try {
-        Get-GPPermission -Guid $g.Id -Domain $Domain -Server $Server -All | ForEach-Object {
-            $perms.Add([PSCustomObject]@{
-                    Gpo        = $g.DisplayName
-                    GpoId      = $g.Id
-                    Trustee    = $_.Trustee.Name
-                    TrusteeSid = $_.Trustee.Sid.Value
-                    SidType    = $_.Trustee.SidType
-                    Permission = $_.Permission
-                    Inherited  = $_.Inherited
-                    Applies    = ($_.Permission -match 'Apply')
-                })
-        }
-    }
-    catch {
-        Write-Warning "$($g.DisplayName) : $($_.Exception.Message)"
-    }
+    try { Read-GpoPermissions -Gpo $g }
+    catch { $permFailures.Add($g.DisplayName) }
 }
 Write-Progress -Activity 'Reading permissions' -Completed
 
-$perms | Export-Csv (Join-Path $OutDir "$Domain-filtering.csv") -NoTypeInformation -Encoding UTF8
-Write-Host "  permission entries: $($perms.Count)"
+# second pass over whatever came back empty
+$covered = @($perms.Gpo | Sort-Object -Unique)
+$missing = $gpos | Where-Object { $covered -notcontains $_.DisplayName }
 
-# --- filtering analysis ---
-$byGpo = $perms | Group-Object Gpo
-
-# Map policy name -> whether it carries any User-side settings.
-# MS16-072 only affects the User half: computer policies are already
-# retrieved in the computer's own security context.
-$hasUserSide = @{}
-foreach ($g in $gpos) {
-    $hasUserSide[$g.DisplayName] = ([int]$g.UserVersionAD -gt 0)
-}
-
-# a) policies nobody can apply
-$noApply = $byGpo | Where-Object { -not ($_.Group | Where-Object Applies) }
-
-# b) policies filtered to specific groups (Authenticated Users lost Apply)
-$groupFiltered = $byGpo | Where-Object {
-    $applying = $_.Group | Where-Object Applies
-    $applying -and -not ($applying | Where-Object { $_.TrusteeSid -eq $AUTH_USERS_SID })
-}
-
-# c) MS16-072: no Read for Authenticated Users / Domain Computers
-#    AND the policy actually has User-side settings
-$noRead = $byGpo | Where-Object {
-    -not ($_.Group | Where-Object {
-            $_.TrusteeSid -eq $AUTH_USERS_SID -or $_.TrusteeSid -like "*$DOM_COMPUTERS"
-        })
-}
-$ms16072 = $noRead | Where-Object { $hasUserSide[$_.Name] }
-$noReadCompOnly = $noRead | Where-Object { -not $hasUserSide[$_.Name] }
-
-Write-Host "`n--- Filtering ---" -ForegroundColor Cyan
-Write-Host "Filtered to specific groups:  $(@($groupFiltered).Count)"
-Write-Host "Nobody can apply:             $(@($noApply).Count)"
-Write-Host "MS16-072 risk (User side):    $(@($ms16072).Count)"
-Write-Host "No Read, computer-only (ok):  $(@($noReadCompOnly).Count)"
-
-if ($groupFiltered) {
-    Write-Host "`nGroup-filtered policies:" -ForegroundColor DarkYellow
-    foreach ($x in $groupFiltered) {
-        $who = ($x.Group | Where-Object Applies | Select-Object -Expand Trustee) -join ', '
-        $side = if ($hasUserSide[$x.Name]) { 'User+PC' } else { 'PC only' }
-        Write-Host ("  {0,-8} {1}  ->  {2}" -f $side, $x.Name, $who)
-    }
-}
-if ($noApply) {
-    Write-Host "`nNo Apply permission for anyone (policy is inert):" -ForegroundColor DarkYellow
-    $noApply | ForEach-Object { "  $($_.Name)" }
-}
-if ($ms16072) {
-    Write-Host "`nMS16-072 RISK - policy has User-side settings but neither" -ForegroundColor Red
-    Write-Host "Authenticated Users nor Domain Computers can read it." -ForegroundColor Red
-    Write-Host "Since MS16-072 the User half is fetched in the COMPUTER context," -ForegroundColor Red
-    Write-Host "so it silently fails even for users in the right group." -ForegroundColor Red
-    Write-Host "Fix: grant Authenticated Users the Read permission WITHOUT Apply." -ForegroundColor Red
-    foreach ($x in $ms16072) {
-        $who = ($x.Group | Where-Object Applies | Select-Object -Expand Trustee) -join ', '
-        Write-Host ("  {0}  ->  {1}" -f $x.Name, $who)
-    }
-}
-if ($noReadCompOnly) {
-    Write-Host "`nNo Read for Authenticated Users, but computer-side only - not affected" -ForegroundColor DarkGray
-    Write-Host "by MS16-072. Verify the target group holds computer accounts:" -ForegroundColor DarkGray
-    foreach ($x in $noReadCompOnly) {
-        $who = ($x.Group | Where-Object Applies | Select-Object -Expand Trustee) -join ', '
-        Write-Host ("  {0}  ->  {1}" -f $x.Name, $who) -ForegroundColor DarkGray
+if ($missing) {
+    Write-Host "  second pass over $(@($missing).Count) policies with no ACL data" -ForegroundColor DarkYellow
+    Start-Sleep -Seconds 2
+    foreach ($g in $missing) {
+        try {
+            Read-GpoPermissions -Gpo $g
+            [void]$permFailures.Remove($g.DisplayName)
+        }
+        catch { if ($permFailures -notcontains $g.DisplayName) { $permFailures.Add($g.DisplayName) } }
     }
 }
 
-# --- machine-readable summary of the filtering analysis ---
-$analysis = foreach ($x in $byGpo) {
-    $applying = $x.Group | Where-Object Applies
-    [PSCustomObject]@{
-        Gpo             = $x.Name
-        AppliesTo       = ($applying | Select-Object -Expand Trustee) -join '; '
-        HasUserSettings = [bool]$hasUserSide[$x.Name]
-        AuthUsersApply  = [bool]($applying | Where-Object { $_.TrusteeSid -eq $AUTH_USERS_SID })
-        AuthUsersRead   = [bool]($x.Group  | Where-Object { $_.TrusteeSid -eq $AUTH_USERS_SID })
-        DomCompRead     = [bool]($x.Group  | Where-Object { $_.TrusteeSid -like "*$DOM_COMPUTERS" })
-        Ms16072Risk     = [bool](($ms16072 | Select-Object -Expand Name) -contains $x.Name)
+$covered = @($perms.Gpo | Sort-Object -Unique)
+$stillMissing = @($gpos | Where-Object { $covered -notcontains $_.DisplayName })
+
+# Fallback: the most common S-1-5-21 prefix in the ACLs is this domain
+if (-not $domSid) {
+    $prefixes = $perms |
+    Where-Object { $_.TrusteeSid -like 'S-1-5-21-*' } |
+    ForEach-Object { ($_.TrusteeSid -split '-')[0..6] -join '-' } |
+    Group-Object | Sort-Object Count -Descending
+    if ($prefixes) {
+        $domSid = $prefixes[0].Name
+        Write-Host "  domain SID derived from ACLs: $domSid" -ForegroundColor DarkYellow
     }
 }
-$analysis | Sort-Object Gpo |
-Export-Csv (Join-Path $OutDir "$Domain-filtering-analysis.csv") -NoTypeInformation -Encoding UTF8
+
+[void](Out-Table $perms 'permissions')
+Write-Host "  ACL entries: $($perms.Count), policies covered: $(@($covered).Count)/$(@($gpos).Count)"
 
 # ---------------------------------------------------------------
-# 8. Archive
+# 6. Raw Apply ACEs - the only way to see Deny
 # ---------------------------------------------------------------
-$zip = "C:\gpo-map-$Domain.zip"
-Compress-Archive -Path (Join-Path $OutDir '*.csv') -DestinationPath $zip -Force
-Write-Host "`nDone. Archive: $zip" -ForegroundColor Green
+Write-Step "[6/7] Apply ACEs (Allow and Deny)"
+
+$aces = New-Object System.Collections.Generic.List[object]
+try {
+    $gpcs = Search-Directory -Base "CN=Policies,CN=System,$baseDn" `
+        -Filter '(objectClass=groupPolicyContainer)' `
+        -Properties 'cn', 'displayname', 'ntsecuritydescriptor' -WithDacl
+
+    foreach ($r in $gpcs) {
+        $cn = Get-Prop $r 'cn'
+        $dn = Get-Prop $r 'displayname'
+        $raw = ConvertTo-ByteArray (Get-Prop $r 'ntsecuritydescriptor')
+        if (-not $raw) { continue }
+
+        $sd = New-Object System.DirectoryServices.ActiveDirectorySecurity
+        $sd.SetSecurityDescriptorBinaryForm($raw)
+
+        foreach ($ace in $sd.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+            if ($ace.ObjectType -ne $APPLY_GP_GUID) { continue }
+            $sid = $ace.IdentityReference.Value
+            $aces.Add([PSCustomObject]@{
+                    Gpo        = $dn
+                    GpoCn      = $cn
+                    TrusteeSid = $sid
+                    Trustee    = (Resolve-Sid $sid)
+                    AceType    = $ace.AccessControlType    # Allow / Deny
+                    Rights     = $ace.ActiveDirectoryRights
+                    Inherited  = $ace.IsInherited
+                })
+        }
+    }
+    [void](Out-Table $aces 'applyaces')
+    $denies = @($aces | Where-Object { $_.AceType -eq 'Deny' })
+    Write-Host "  Apply ACEs: $($aces.Count), of them Deny: $($denies.Count)"
+    foreach ($d in $denies) { Write-Host "    DENY  $($d.Gpo)  ->  $($d.Trustee)" -ForegroundColor DarkYellow }
+}
+catch { Write-Warning "Apply ACEs: $($_.Exception.Message)" }
+
+# ---------------------------------------------------------------
+# 7. Membership of groups seen in Apply ACEs
+# ---------------------------------------------------------------
+Write-Step "[7/7] Group membership"
+
+$skipRids = @('-512', '-513', '-515', '-516', '-518', '-519', '-520')
+$skipSids = @('S-1-5-11', 'S-1-1-0', 'S-1-5-9', 'S-1-5-18')
+
+$fromPerms = $perms | Where-Object { $_.Applies -and $_.SidType -eq 'Group' } |
+Select-Object @{N = 'Sid'; E = { $_.TrusteeSid } }, @{N = 'Name'; E = { $_.Trustee } }
+$fromAces = $aces | Select-Object @{N = 'Sid'; E = { $_.TrusteeSid } }, @{N = 'Name'; E = { $_.Trustee } }
+$applyGroups = @($fromPerms) + @($fromAces) | Sort-Object Sid -Unique
+
+$members = New-Object System.Collections.Generic.List[object]
+$k = 0
+foreach ($grp in $applyGroups) {
+    $k++
+    Write-Progress -Activity 'Resolving groups' -Status $grp.Name -PercentComplete ($k * 100 / @($applyGroups).Count)
+
+    $isBuiltin = ($skipSids -contains $grp.Sid) -or
+    (@($skipRids | Where-Object { $grp.Sid -like "*$_" }).Count -gt 0)
+    if ($isBuiltin) {
+        $members.Add([PSCustomObject]@{
+                GroupName = $grp.Name; GroupSid = $grp.Sid; MemberDn = $null
+                MemberName = $null; MemberClass = 'builtin-not-enumerated'
+                Note = 'well-known group, skipped'
+            })
+        continue
+    }
+
+    try {
+        $obj = [ADSI]"LDAP://$Server/<SID=$($grp.Sid)>"
+        $memberDns = @($obj.Properties['member'])
+
+        if ($memberDns.Count -eq 0) {
+            $members.Add([PSCustomObject]@{
+                    GroupName = $grp.Name; GroupSid = $grp.Sid; MemberDn = $null
+                    MemberName = $null; MemberClass = 'empty'; Note = 'group has no members'
+                })
+            continue
+        }
+        if ($memberDns.Count -gt $MaxGroupMembers) {
+            $members.Add([PSCustomObject]@{
+                    GroupName = $grp.Name; GroupSid = $grp.Sid; MemberDn = $null
+                    MemberName = $null; MemberClass = 'too-many'
+                    Note = "$($memberDns.Count) members, not enumerated"
+                })
+            continue
+        }
+
+        foreach ($dn in $memberDns) {
+            try {
+                $m = [ADSI]"LDAP://$Server/$dn"
+                $members.Add([PSCustomObject]@{
+                        GroupName   = $grp.Name
+                        GroupSid    = $grp.Sid
+                        MemberDn    = $dn
+                        MemberName  = @($m.Properties['sAMAccountName'])[0]
+                        MemberClass = @($m.Properties['objectClass'])[-1]
+                        Note        = $null
+                    })
+            }
+            catch {
+                $members.Add([PSCustomObject]@{
+                        GroupName = $grp.Name; GroupSid = $grp.Sid; MemberDn = $dn
+                        MemberName = $null; MemberClass = 'unresolved'; Note = $_.Exception.Message
+                    })
+            }
+        }
+    }
+    catch { Write-Warning "$($grp.Name) : $($_.Exception.Message)" }
+}
+Write-Progress -Activity 'Resolving groups' -Completed
+[void](Out-Table $members 'groupmembers')
+Write-Host "  groups: $(@($applyGroups).Count), member records: $($members.Count)"
+
+# ---------------------------------------------------------------
+# Metadata and completeness verdict
+# ---------------------------------------------------------------
+Complete-LastStep
+
+$finishedAt = Get-Date
+$complete = (@($stillMissing).Count -eq 0 -and @($linkFailures).Count -eq 0)
+
+$missingNames = @($stillMissing | ForEach-Object { [string]$_.DisplayName })
+$failedOus = @($linkFailures | ForEach-Object { [string]$_ })
+
+$meta = [PSCustomObject]@{
+    Domain         = $Domain
+    Server         = $Server
+    BaseDn         = $baseDn
+    DomainSid      = $domSid
+    CollectedAt    = $startedAt.ToString('yyyy-MM-dd HH:mm:ss')
+    FinishedAt     = $finishedAt.ToString('yyyy-MM-dd HH:mm:ss')
+    ElapsedSec     = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+    CollectedBy    = "$env:USERNAME on $env:COMPUTERNAME"
+    OuCount        = @($ous).Count
+    LinkCount      = @($links | Where-Object DisplayName).Count
+    GpoCount       = @($gpos).Count
+    PermCount      = @($perms).Count
+    AceCount       = @($aces).Count
+    GroupCount     = @($applyGroups).Count
+    Complete       = $complete
+    MissingAclGpos = ($missingNames -join '; ')
+    FailedLinkOus  = ($failedOus -join '; ')
+}
+try { [void](Out-Table $meta 'meta') }
+catch { Write-Warning "Could not write meta.csv: $($_.Exception.Message)" }
+
+Write-Host ""
+if ($complete) {
+    Write-Host "COLLECTION COMPLETE - all $(@($gpos).Count) policies have ACL data" -ForegroundColor Green
+}
+else {
+    Write-Host "COLLECTION INCOMPLETE" -ForegroundColor Red
+    if ($stillMissing) {
+        Write-Host "  no ACL data for $(@($stillMissing).Count) policies:" -ForegroundColor Red
+        $stillMissing | ForEach-Object { Write-Host "    $($_.DisplayName)" -ForegroundColor Red }
+    }
+    if ($linkFailures.Count) {
+        Write-Host "  links unreadable on $($linkFailures.Count) containers" -ForegroundColor Red
+    }
+    Write-Host "  Usual cause: an expiring Kerberos ticket in a runas /netonly window." -ForegroundColor Yellow
+    Write-Host "  Open a fresh window and run again before trusting the analysis." -ForegroundColor Yellow
+}
+
+# ---------------------------------------------------------------
+# Archive and timing
+# ---------------------------------------------------------------
+if (-not $NoZip) {
+    try {
+        $zip = "C:\gpo-map-$Domain.zip"
+        Compress-Archive -Path (Join-Path $OutDir '*.csv') -DestinationPath $zip -Force
+        Write-Host "`nArchive: $zip" -ForegroundColor Green
+    }
+    catch { Write-Warning "Could not build the archive: $($_.Exception.Message)" }
+}
 
 $sw.Stop()
-
-Write-Host "`n--- Timing ---" -ForegroundColor Cyan
-for ($k = 0; $k -lt $script:StepMarks.Count; $k++) {
-    $from = $script:StepMarks[$k].At
-    $to = if ($k + 1 -lt $script:StepMarks.Count) { $script:StepMarks[$k + 1].At } else { $sw.Elapsed }
-    Write-Host ("  {0,-30} {1:mm\:ss}" -f $script:StepMarks[$k].Label, ($to - $from))
+try {
+    Write-Host "`n--- Timing ---" -ForegroundColor Cyan
+    for ($n = 0; $n -lt $script:StepMarks.Count; $n++) {
+        $from = [TimeSpan]$script:StepMarks[$n].At
+        $to = if ($n + 1 -lt $script:StepMarks.Count) { [TimeSpan]$script:StepMarks[$n + 1].At } else { $sw.Elapsed }
+        $dur = $to - $from
+        Write-Host ("  {0,-30} {1}" -f [string]$script:StepMarks[$n].Label, $dur.ToString('mm\:ss'))
+    }
 }
-Write-Host ("  {0,-30} {1:hh\:mm\:ss}" -f 'TOTAL', $sw.Elapsed) -ForegroundColor Green
+catch { Write-Warning "Timing table: $($_.Exception.Message)" }
+Write-Host ""
+Write-Host ("=" * 52) -ForegroundColor Cyan
+Write-Host ("  Started:       " + $startedAt.ToString('yyyy-MM-dd HH:mm:ss'))
+Write-Host ("  Finished:      " + $finishedAt.ToString('yyyy-MM-dd HH:mm:ss'))
+Write-Host ("  Total elapsed: " + $sw.Elapsed.ToString('hh\:mm\:ss') +
+    "  (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + " sec)") -ForegroundColor Green
+Write-Host ("=" * 52) -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Next step:  .\Analyze-GpoMap.ps1 -Path '$OutDir'" -ForegroundColor Cyan
+Write-Host ""
+
+if ($FailOnIncomplete -and -not $complete) { throw 'Collection incomplete - see the list above.' }

@@ -24,5 +24,18 @@ Copy-Item \\dc-nnn.nnn.lo\c$\gpo-export\nnn.html C:\gpo-export\
 .\Export-GpoReport.ps1 -Domain kkk.lo -Server dc-kkk.kkk.lo
 ########################################################################
 
+#Execute Scripts
 Get-ChildItem . -Filter *.ps1 | Unblock-File
 ########################################################################
+
+.\Export-GpoMap.ps1 -OutDir "C:\gpo-export\$(Get-Date -f yyyy-MM-dd)"
+.\Export-GpoMap.ps1 -outdir "c:\gpo-export\$(get-date -f yyyy-mm-dd)"
+
+.\Analyze-GpoMap.ps1 -Path "C:\gpo-export\$(Get-Date -f yyyy-MM-dd)"
+.\Analyze-GpoMap.ps1 -path c:\gpo-export\2026-08-11 -domain nnn.lo
+
+.\run-gpo.ps1
+.\run-gpo.ps1 -domain kkk.lo -server dc-iiii.kkk.lo
+
+git diff --staged > staged_changes.diff
+
