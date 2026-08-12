@@ -46,6 +46,7 @@ Get-ChildItem . -Filter *.ps1 | Unblock-File
 
 #Git
 git diff --staged > staged_changes.diff
+git diff --staged --no-textconv > staged_changes.diff
 ########################################################################
 
 #Правка политик
