@@ -297,8 +297,8 @@ Write-Section 'Privileged access'
 $priv = $d.privileged
 $byGroup = $priv | Group-Object Group
 foreach ($g in $byGroup) {
-    $users = @($g.Group | Where-Object { $_.Class -eq 'user' })
-    Write-Finding ("    {0,-30} {1} member(s)" -f $g.Name, @($g.Group).Count)
+    $userCount = @($g.Group | Where-Object { $_.Class -eq 'user' }).Count
+    Write-Finding ("    {0,-30} {1} member(s), {2} user account(s)" -f $g.Name, @($g.Group).Count, $userCount)
     foreach ($m in $g.Group) {
         $flags = @()
         if ($m.Enabled -ne 'True') { $flags += 'disabled' }

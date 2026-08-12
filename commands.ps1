@@ -15,7 +15,8 @@ C:\gpo-export\nnn.html -Encoding utf8
 ########################################################################
 
 #Загрузка скриптов на DC
-copy-item c:\users\adm\documents\projects\innosoft\dc_actions \\dc-nnn.nnn.lo\c$\scripts\ -recurse -force
+copy-item c:\users\adm\documents\projects\innosoft\dc_actions\* \\dc-nnn.nnn.lo\c$\scripts\ -recurse -force
+copy-item c:\users\adm\documents\projects\innosoft\dc_actions\*.ps1 \\dc-nnn.nnn.lo\c$\scripts\ -force
 get-childitem c:\scripts\dc_actions -recurse | unblock-file
 ########################################################################
 
