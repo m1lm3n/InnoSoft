@@ -193,7 +193,7 @@ Write-Host "Domain SID: $domSid" -ForegroundColor DarkGray
 # ---------------------------------------------------------------
 # 1. Domain controllers
 # ---------------------------------------------------------------
-Write-Step "[1/7] Domain controllers"
+Write-Step "[1/9] Domain controllers"
 
 $dcs = @()
 try {
@@ -251,7 +251,7 @@ catch { Write-Warning "Domain controllers: $($_.Exception.Message)" }
 # ---------------------------------------------------------------
 # 2. FSMO roles
 # ---------------------------------------------------------------
-Write-Step "[2/7] FSMO roles"
+Write-Step "[2/9] FSMO roles"
 
 $fsmo = @()
 try {
@@ -280,7 +280,7 @@ catch { Write-Warning "FSMO: $($_.Exception.Message)" }
 # ---------------------------------------------------------------
 # 3. Replication (repadmin)
 # ---------------------------------------------------------------
-Write-Step "[3/7] Replication"
+Write-Step "[3/9] Replication"
 
 $repl = @()
 $repadmin = Get-Command repadmin.exe -ErrorAction SilentlyContinue
@@ -320,7 +320,7 @@ else {
 # ---------------------------------------------------------------
 # 4. Backup age
 # ---------------------------------------------------------------
-Write-Step "[4/7] AD backup age"
+Write-Step "[4/9] AD backup age"
 
 $backup = @()
 if ($repadmin) {
@@ -356,7 +356,7 @@ if ($repadmin) {
 # ---------------------------------------------------------------
 # 5. Sites, subnets, site links
 # ---------------------------------------------------------------
-Write-Step "[5/7] Sites and subnets"
+Write-Step "[5/9] Sites and subnets"
 
 $sites = @(); $subnets = @(); $siteLinks = @()
 try {
@@ -410,7 +410,7 @@ catch { Write-Warning "Sites: $($_.Exception.Message)" }
 # ---------------------------------------------------------------
 # 6. Privileged group membership (recursive)
 # ---------------------------------------------------------------
-Write-Step "[6/7] Privileged access"
+Write-Step "[6/9] Privileged access"
 
 $privileged = @()
 try {
@@ -468,7 +468,7 @@ catch { Write-Warning "Privileged access: $($_.Exception.Message)" }
 # ---------------------------------------------------------------
 # 7. Domain-wide settings
 # ---------------------------------------------------------------
-Write-Step "[7/7] Domain settings"
+Write-Step "[7/9] Domain settings"
 
 $domainInfo = $null
 try {
@@ -537,6 +537,152 @@ try {
 catch { Write-Warning "Domain settings: $($_.Exception.Message)" }
 
 # ---------------------------------------------------------------
+# 8. Kerberos delegation
+# ---------------------------------------------------------------
+Write-Step "[8/9] Kerberos delegation"
+
+$delegation = New-Object System.Collections.Generic.List[object]
+try {
+    # userAccountControl bits that matter here
+    $UAC_TRUSTED_FOR_DELEGATION = 0x80000      # unconstrained
+    $UAC_TRUSTED_TO_AUTH = 0x1000000    # protocol transition (S4U2Self)
+    $UAC_NOT_DELEGATED = 0x100000     # "sensitive, cannot be delegated"
+    $UAC_SERVER_TRUST = 0x2000       # domain controller
+
+    $delRes = Search-Directory -Base $baseDn `
+        -Filter '(|(userAccountControl:1.2.840.113556.1.4.803:=524288)(msDS-AllowedToDelegateTo=*)(userAccountControl:1.2.840.113556.1.4.803:=16777216)(msDS-AllowedToActOnBehalfOfOtherIdentity=*))' `
+        -Properties 'samaccountname', 'objectclass', 'useraccountcontrol', 'distinguishedname',
+    'msds-allowedtodelegateto', 'msds-allowedtoactonbehalfofotheridentity',
+    'serviceprincipalname', 'pwdlastset'
+
+    foreach ($r in $delRes) {
+        $uac = [int](Get-Prop $r 'useraccountcontrol')
+        $isDc = (($uac -band $UAC_SERVER_TRUST) -ne 0)
+
+        # A DirectorySearcher result exposes every requested property, so
+        # .Count alone is not proof the attribute holds anything. Filter for
+        # real values, otherwise every DC looks constrained with no targets.
+        $allowedTo = @($r.Properties['msds-allowedtodelegateto'] | Where-Object { "$_".Trim() })
+        $rbcdRaw = @($r.Properties['msds-allowedtoactonbehalfofotheridentity'] | Where-Object { $_ })
+
+        $type = @()
+        if (($uac -band $UAC_TRUSTED_FOR_DELEGATION) -ne 0) { $type += 'Unconstrained' }
+        if ($allowedTo.Count) {
+            if (($uac -band $UAC_TRUSTED_TO_AUTH) -ne 0) { $type += 'Constrained+ProtocolTransition' }
+            else { $type += 'Constrained' }
+        }
+        elseif (($uac -band $UAC_TRUSTED_TO_AUTH) -ne 0) {
+            # protocol transition set without any target service
+            $type += 'ProtocolTransition (no targets)'
+        }
+        if ($rbcdRaw.Count) { $type += 'ResourceBased' }
+        if (-not $type) { continue }
+
+        # RBCD stores a security descriptor; pull out who is allowed
+        $rbcdWho = $null
+        try {
+            $raw = if ($rbcdRaw.Count) { ConvertTo-ByteArray $rbcdRaw[0] } else { $null }
+            if ($raw) {
+                $sd = New-Object System.DirectoryServices.ActiveDirectorySecurity
+                $sd.SetSecurityDescriptorBinaryForm($raw)
+                $sids = @($sd.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
+                    ForEach-Object { $_.IdentityReference.Value }) | Sort-Object -Unique
+                $rbcdWho = ($sids -join '; ')
+            }
+        }
+        catch { }
+
+        $delegation.Add([PSCustomObject]@{
+                Name               = Get-Prop $r 'samaccountname'
+                Class              = @($r.Properties['objectclass'])[-1]
+                IsDomainController = $isDc
+                DelegationType     = ($type -join ', ')
+                AllowedTo          = ($allowedTo -join '; ')
+                RbcdAllowedFrom    = $rbcdWho
+                Spn                = (@($r.Properties['serviceprincipalname']) -join '; ')
+                Sensitive          = (($uac -band $UAC_NOT_DELEGATED) -ne 0)
+                Enabled            = (($uac -band 2) -eq 0)
+                DistinguishedName  = Get-Prop $r 'distinguishedname'
+            })
+    }
+
+    [void](Out-Table $delegation 'delegation')
+    $unc = @($delegation | Where-Object { $_.DelegationType -match 'Unconstrained' -and -not $_.IsDomainController })
+    Write-Host "  delegation objects: $($delegation.Count)  (unconstrained outside DCs: $($unc.Count))" `
+        -ForegroundColor $(if ($unc.Count) { 'Red' } else { 'Gray' })
+    foreach ($u in $unc) { Write-Host "    UNCONSTRAINED  $($u.Name)  [$($u.Class)]" -ForegroundColor Red }
+}
+catch { Write-Warning "Delegation: $($_.Exception.Message)" }
+
+# ---------------------------------------------------------------
+# 9. Service accounts, SPNs and weak Kerberos settings
+# ---------------------------------------------------------------
+Write-Step "[9/9] Service accounts and SPNs"
+
+$spnAccounts = New-Object System.Collections.Generic.List[object]
+try {
+    $UAC_DONT_REQ_PREAUTH = 0x400000   # AS-REP roastable
+    $UAC_REVERSIBLE = 0x80       # password stored reversibly
+    $UAC_DONT_EXPIRE = 0x10000
+
+    # user objects only: computer SPNs are normal and not roastable in practice
+    # krbtgt and the RODC krbtgt_* clones carry a system SPN by design and
+    # cannot be changed; leaving them in only produces noise.
+    $spnRes = Search-Directory -Base $baseDn `
+        -Filter '(&(objectCategory=person)(objectClass=user)(!(samAccountName=krbtgt))(!(samAccountName=krbtgt_*))(|(servicePrincipalName=*)(userAccountControl:1.2.840.113556.1.4.803:=4194304)(userAccountControl:1.2.840.113556.1.4.803:=128)))' `
+        -Properties 'samaccountname', 'useraccountcontrol', 'serviceprincipalname', 'pwdlastset',
+    'lastlogontimestamp', 'admincount', 'msds-supportedencryptiontypes',
+    'distinguishedname', 'description', 'memberof'
+
+    foreach ($r in $spnRes) {
+        $uac = [int](Get-Prop $r 'useraccountcontrol')
+        $pwdSet = ConvertFrom-FileTimeSafe (Get-Prop $r 'pwdlastset')
+        $lastOn = ConvertFrom-FileTimeSafe (Get-Prop $r 'lastlogontimestamp')
+        $enc = Get-Prop $r 'msds-supportedencryptiontypes'
+
+        # 0 or unset means the default set, which still allows RC4
+        $encNames = @()
+        if ($null -ne $enc) {
+            $e = [int]$enc
+            if ($e -band 1) { $encNames += 'DES-CRC' }
+            if ($e -band 2) { $encNames += 'DES-MD5' }
+            if ($e -band 4) { $encNames += 'RC4' }
+            if ($e -band 8) { $encNames += 'AES128' }
+            if ($e -band 16) { $encNames += 'AES256' }
+        }
+
+        $spns = @($r.Properties['serviceprincipalname'])
+
+        $spnAccounts.Add([PSCustomObject]@{
+                Name                 = Get-Prop $r 'samaccountname'
+                Description          = Get-Prop $r 'description'
+                SpnCount             = $spns.Count
+                Spn                  = ($spns -join '; ')
+                Enabled              = (($uac -band 2) -eq 0)
+                PasswordNeverExpires = (($uac -band $UAC_DONT_EXPIRE) -ne 0)
+                NoPreauth            = (($uac -band $UAC_DONT_REQ_PREAUTH) -ne 0)
+                ReversiblePassword   = (($uac -band $UAC_REVERSIBLE) -ne 0)
+                AdminCount           = Get-Prop $r 'admincount'
+                EncryptionTypes      = if ($encNames) { $encNames -join ',' } else { 'default (RC4 allowed)' }
+                PasswordLastSet      = if ($pwdSet) { $pwdSet.ToString('yyyy-MM-dd') } else { $null }
+                PasswordAgeDays      = if ($pwdSet) { [int]((Get-Date) - $pwdSet).TotalDays } else { $null }
+                LastLogonDaysAgo     = if ($lastOn) { [int]((Get-Date) - $lastOn).TotalDays } else { $null }
+                MemberOf             = (@($r.Properties['memberof']) | ForEach-Object { ($_ -split ',')[0] -replace '^CN=', '' }) -join '; '
+                DistinguishedName    = Get-Prop $r 'distinguishedname'
+            })
+    }
+
+    [void](Out-Table $spnAccounts 'spn')
+    $roastable = @($spnAccounts | Where-Object { $_.SpnCount -gt 0 -and $_.Enabled })
+    $asrep = @($spnAccounts | Where-Object { $_.NoPreauth })
+    $rev = @($spnAccounts | Where-Object { $_.ReversiblePassword })
+    Write-Host "  accounts with SPN: $($roastable.Count), without preauth: $($asrep.Count), reversible password: $($rev.Count)"
+    foreach ($a in $asrep) { Write-Host "    NO PREAUTH  $($a.Name)" -ForegroundColor Red }
+    foreach ($a in $rev) { Write-Host "    REVERSIBLE  $($a.Name)" -ForegroundColor Red }
+}
+catch { Write-Warning "Service accounts: $($_.Exception.Message)" }
+
+# ---------------------------------------------------------------
 # Metadata
 # ---------------------------------------------------------------
 Complete-LastStep
@@ -557,6 +703,8 @@ $metaSpec = @(
     @{ Name = 'SubnetCount'; Get = { [int]@($subnets).Count } }
     @{ Name = 'ReplLinks'; Get = { [int]@($repl).Count } }
     @{ Name = 'PrivEntries'; Get = { [int]@($privileged).Count } }
+    @{ Name = 'DelegationObjects'; Get = { [int]$delegation.Count } }
+    @{ Name = 'SpnAccounts'; Get = { [int]$spnAccounts.Count } }
     @{ Name = 'RepadminUsed'; Get = { [bool]$repadmin } }
 )
 foreach ($f in $metaSpec) {

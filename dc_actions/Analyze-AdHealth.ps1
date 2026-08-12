@@ -56,7 +56,8 @@ function Import-Set {
     }
     $set = @{ Domain = $Dom }
     foreach ($part in 'dcs', 'fsmo', 'replication', 'backup', 'sites', 'subnets',
-        'sitelinks', 'privileged', 'domaininfo', 'adhealth-meta') {
+        'sitelinks', 'privileged', 'domaininfo', 'delegation', 'spn',
+        'adhealth-meta') {
         $file = Join-Path $Folder "$Dom-$part.csv"
         if (Test-Path $file) {
             $rows = @(Import-Csv $file)
@@ -389,6 +390,173 @@ if ($info) {
 else { Write-Finding "No domain settings collected" 'warn' }
 
 # ---------------------------------------------------------------
+# 7a. Kerberos delegation
+# ---------------------------------------------------------------
+Write-Section 'Kerberos delegation'
+
+$deleg = $d.delegation
+if (-not $deleg.Count) {
+    Write-Finding "No delegation configured anywhere - that is the safest state" 'ok'
+}
+else {
+    # DelegationType is a comma separated list. Substring matching is wrong
+    # here: 'Constrained' is contained in 'Unconstrained', which silently
+    # counted every domain controller as constrained too.
+    function Test-DelegationType {
+        param($Row, [string]$Wanted)
+        $types = @("$($Row.DelegationType)" -split ',' | ForEach-Object { $_.Trim() })
+        foreach ($t in $types) {
+            if ($t -eq $Wanted) { return $true }
+            if ($Wanted -eq 'Constrained' -and $t -eq 'Constrained+ProtocolTransition') { return $true }
+        }
+        return $false
+    }
+
+    $unconstrained = @($deleg | Where-Object { (Test-DelegationType $_ 'Unconstrained') -and $_.IsDomainController -ne 'True' })
+    $dcUnconstrained = @($deleg | Where-Object { (Test-DelegationType $_ 'Unconstrained') -and $_.IsDomainController -eq 'True' })
+    $constrained = @($deleg | Where-Object { Test-DelegationType $_ 'Constrained' })
+    $protocolTransition = @($deleg | Where-Object { "$($_.DelegationType)" -match 'ProtocolTransition' })
+    $rbcd = @($deleg | Where-Object { Test-DelegationType $_ 'ResourceBased' })
+
+    Write-Finding "Objects with delegation: $($deleg.Count)"
+    Write-Finding "  unconstrained (non-DC): $($unconstrained.Count)   on DCs: $($dcUnconstrained.Count) (expected)"
+    Write-Finding "  constrained: $($constrained.Count)   with protocol transition: $($protocolTransition.Count)"
+    Write-Finding "  resource-based: $($rbcd.Count)"
+
+    if ($unconstrained.Count) {
+        Write-Host ""
+        Write-Finding "UNCONSTRAINED DELEGATION outside domain controllers: $($unconstrained.Count)" 'high'
+        Write-Finding "  Any account that authenticates to such a host leaves a usable ticket" 'high'
+        Write-Finding "  in its memory, including a domain admin. Compromising the host then" 'high'
+        Write-Finding "  yields those tickets. This is one of the shortest paths to the domain." 'high'
+        foreach ($u in $unconstrained) {
+            Write-Finding "    $($u.Name)  [$($u.Class)]  $(if ($u.Enabled -ne 'True') { '(disabled)' })" 'high'
+            Add-Finding 'Delegation' 'high' $u.Name "unconstrained delegation on a $($u.Class)"
+        }
+        Write-Finding "  Fix: switch these to constrained delegation, or drop delegation entirely." 'info'
+    }
+    else {
+        Write-Finding "No unconstrained delegation outside DCs" 'ok'
+        if ($deleg.Count -eq $dcUnconstrained.Count) {
+            Write-Finding "Only the domain controllers delegate, which is how it should be." 'ok'
+        }
+    }
+
+    if ($protocolTransition.Count) {
+        Write-Host ""
+        Write-Finding "Constrained delegation with protocol transition: $($protocolTransition.Count)" 'warn'
+        Write-Finding "  These can impersonate any user to the listed services without that" 'info'
+        Write-Finding "  user ever authenticating. Check the target service list is minimal." 'info'
+        foreach ($p in $protocolTransition) {
+            Write-Finding "    $($p.Name) -> $($p.AllowedTo)" 'warn'
+            Add-Finding 'Delegation' 'medium' $p.Name "protocol transition to: $($p.AllowedTo)"
+        }
+    }
+
+    foreach ($c in ($constrained | Where-Object { "$($_.DelegationType)" -notmatch 'ProtocolTransition' -and $_.AllowedTo })) {
+        Write-Finding "    constrained: $($c.Name) -> $($c.AllowedTo)"
+    }
+
+    if ($rbcd.Count) {
+        Write-Host ""
+        Write-Finding "Resource-based constrained delegation: $($rbcd.Count)" 'warn'
+        foreach ($r in $rbcd) {
+            Write-Finding "    $($r.Name) accepts delegation from: $($r.RbcdAllowedFrom)" 'warn'
+            Add-Finding 'Delegation' 'medium' $r.Name "resource-based delegation from $($r.RbcdAllowedFrom)"
+        }
+        Write-Finding "  RBCD can be set by anyone holding write access to the target object," 'info'
+        Write-Finding "  so an unexpected entry here is worth tracing back." 'info'
+    }
+
+    # privileged accounts must be protected from delegation
+    $privNames = @($priv | Where-Object { $_.Class -eq 'user' } | Select-Object -Expand Member -Unique)
+    if ($privNames.Count) {
+        Write-Host ""
+        Write-Finding "Reminder: privileged accounts should be marked sensitive and not" 'info'
+        Write-Finding "delegatable, or placed in the Protected Users group. Neither state is" 'info'
+        Write-Finding "visible in this export - worth checking for these accounts:" 'info'
+        Write-Finding ("    " + ($privNames -join ', '))
+    }
+}
+
+# ---------------------------------------------------------------
+# 7b. Service accounts and SPNs
+# ---------------------------------------------------------------
+Write-Section 'Service accounts and SPNs'
+
+$spn = $d.spn
+if (-not $spn.Count) {
+    Write-Finding "No user accounts with SPNs or weak Kerberos flags" 'ok'
+}
+else {
+    $withSpn = @($spn | Where-Object { [int]$_.SpnCount -gt 0 })
+    $noPreauth = @($spn | Where-Object { $_.NoPreauth -eq 'True' })
+    $reversible = @($spn | Where-Object { $_.ReversiblePassword -eq 'True' })
+    $privSpn = @($withSpn | Where-Object { $_.AdminCount -eq '1' })
+    $rc4 = @($withSpn | Where-Object { $_.EncryptionTypes -match 'RC4|default|DES' })
+    $oldPwd = @($withSpn | Where-Object { $_.PasswordAgeDays -and [int]$_.PasswordAgeDays -gt $StalePasswordDays })
+
+    Write-Finding "User accounts with an SPN: $($withSpn.Count)"
+    foreach ($a in $withSpn) {
+        $flags = @()
+        if ($a.AdminCount -eq '1') { $flags += 'PRIVILEGED' }
+        if ($a.PasswordNeverExpires -eq 'True') { $flags += 'pwd never expires' }
+        if ($a.PasswordAgeDays) { $flags += "pwd $($a.PasswordAgeDays)d" }
+        if ($a.EncryptionTypes -match 'RC4|default|DES') { $flags += $a.EncryptionTypes }
+        if ($a.Enabled -ne 'True') { $flags += 'disabled' }
+        $lvl = if ($a.AdminCount -eq '1') { 'high' } elseif ($flags.Count -gt 2) { 'warn' } else { 'info' }
+        Write-Finding ("    {0,-22} {1}" -f $a.Name, ($flags -join ', ')) $lvl
+        Write-Finding ("        SPN: {0}" -f $a.Spn)
+    }
+
+    if ($privSpn.Count) {
+        Write-Host ""
+        Write-Finding "PRIVILEGED accounts carrying an SPN: $($privSpn.Count)" 'high'
+        Write-Finding "  Anyone in the domain can request a service ticket for these and crack" 'high'
+        Write-Finding "  it offline at their own pace. On an admin account that is a direct" 'high'
+        Write-Finding "  route to domain compromise if the password is not very long." 'high'
+        foreach ($a in $privSpn) {
+            Write-Finding "    $($a.Name)  (groups: $($a.MemberOf))" 'high'
+            Add-Finding 'ServiceAccounts' 'high' $a.Name "privileged account with an SPN, kerberoastable"
+        }
+        Write-Finding "  Fix: remove the privilege, or move to a group Managed Service Account" 'info'
+        Write-Finding "  (gMSA) where the password is 120+ random characters, rotated by AD." 'info'
+    }
+
+    if ($noPreauth.Count) {
+        Write-Host ""
+        Write-Finding "Kerberos pre-authentication disabled: $($noPreauth.Count)" 'high'
+        Write-Finding "  Their password hash can be requested by anyone, no credentials needed." 'high'
+        foreach ($a in $noPreauth) {
+            Write-Finding "    $($a.Name)" 'high'
+            Add-Finding 'ServiceAccounts' 'high' $a.Name 'Kerberos pre-authentication is disabled (AS-REP roastable)'
+        }
+    }
+
+    if ($reversible.Count) {
+        Write-Host ""
+        Write-Finding "Reversible password encryption: $($reversible.Count)" 'high'
+        Write-Finding "  The password is recoverable in clear text from the directory." 'high'
+        foreach ($a in $reversible) {
+            Write-Finding "    $($a.Name)" 'high'
+            Add-Finding 'ServiceAccounts' 'high' $a.Name 'password stored with reversible encryption'
+        }
+    }
+
+    if ($rc4.Count) {
+        Write-Host ""
+        Write-Finding "SPN accounts still allowing RC4 or DES: $($rc4.Count)" 'warn'
+        Write-Finding "  RC4 tickets crack far faster than AES ones. Setting the account to" 'info'
+        Write-Finding "  AES-only removes the cheap attack, but test the service first." 'info'
+        foreach ($a in $rc4) { Add-Finding 'ServiceAccounts' 'medium' $a.Name "encryption: $($a.EncryptionTypes)" }
+    }
+
+    foreach ($a in $oldPwd) {
+        Add-Finding 'ServiceAccounts' 'medium' $a.Name "service account password is $($a.PasswordAgeDays) days old"
+    }
+}
+
+# ---------------------------------------------------------------
 # 8. Comparison
 # ---------------------------------------------------------------
 if ($ComparePath) {
@@ -420,6 +588,19 @@ if ($ComparePath) {
             Add-Finding 'FSMO' 'medium' $f.Role "role moved from $($oldFsmo[$f.Role]) to $($f.Holder)"
         }
     }
+
+    $oldDel = @($p.delegation | ForEach-Object { "$($_.Name)|$($_.DelegationType)" })
+    $newDel = @($deleg | ForEach-Object { "$($_.Name)|$($_.DelegationType)" })
+    foreach ($x in ($newDel | Where-Object { $oldDel -notcontains $_ })) {
+        Write-Finding "    + delegation $x" 'high'
+        Add-Finding 'Delegation' 'high' $x 'delegation added since the baseline'
+    }
+    foreach ($x in ($oldDel | Where-Object { $newDel -notcontains $_ })) { Write-Finding "    - delegation $x" 'warn' }
+
+    $oldSpn = @($p.spn | Where-Object { [int]$_.SpnCount -gt 0 } | ForEach-Object { $_.Name })
+    $newSpn = @($spn | Where-Object { [int]$_.SpnCount -gt 0 } | ForEach-Object { $_.Name })
+    foreach ($x in ($newSpn | Where-Object { $oldSpn -notcontains $_ })) { Write-Finding "    + SPN account $x" 'warn' }
+    foreach ($x in ($oldSpn | Where-Object { $newSpn -notcontains $_ })) { Write-Finding "    - SPN account $x" }
 
     $oldSub = @($p.subnets.Subnet); $newSub = @($subnets.Subnet)
     foreach ($x in ($newSub | Where-Object { $oldSub -notcontains $_ })) { Write-Finding "    + subnet $x" }

@@ -24,7 +24,7 @@ get-childitem c:\scripts\dc_actions -recurse | unblock-file
 Copy-Item \\dc-nnn.nnn.lo\c$\gpo-export\nnn.xml C:\gpo-export\
 Copy-Item \\dc-nnn.nnn.lo\c$\gpo-export\nnn.html C:\gpo-export\
 copy-item \\dc-nnn.nnn.lo\c$\gpo-export\2026-08-12 c:\gpo-export\ -recurse
-copy-item \\dc-nnn.nnn.lo\c$\ad-export\* c:\ad-export\ -recurse
+copy-item \\dc-nnn.nnn.lo\c$\ad-export\* c:\ad-export\ -recurse -force
 ########################################################################
 
 #По другим доменам — с параметрами:
