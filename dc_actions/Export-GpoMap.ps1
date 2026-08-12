@@ -59,6 +59,22 @@ $ErrorActionPreference = 'Stop'
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $startedAt = Get-Date
 
+# Report the real failing line instead of a bare exception at the caller
+trap {
+    Write-Host ""
+    Write-Host "UNHANDLED ERROR" -ForegroundColor Red
+    Write-Host "  $($_.Exception.GetType().FullName): $($_.Exception.Message)" -ForegroundColor Red
+    if ($_.InvocationInfo) {
+        Write-Host "  at line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" -ForegroundColor Red
+    }
+    if ($_.ScriptStackTrace) {
+        Write-Host "  stack:" -ForegroundColor DarkGray
+        $_.ScriptStackTrace -split "`n" | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+    }
+    Write-Host "  CSV files already written to $OutDir are still valid." -ForegroundColor Yellow
+    continue
+}
+
 # Extended right "Apply Group Policy"
 $APPLY_GP_GUID = [guid]'edacfd8f-ffb3-11d1-b41d-00a0c968f939'
 
@@ -108,21 +124,27 @@ function Get-Prop {
 }
 
 $script:StepMarks = New-Object System.Collections.Generic.List[object]
+function Format-Span {
+    # hh:mm:ss always, so runs longer than an hour are not misread
+    param([TimeSpan]$Span)
+    return ('{0:00}:{1:00}:{2:00}' -f [int]$Span.TotalHours, $Span.Minutes, $Span.Seconds)
+}
+
 function Write-Step {
     param([string]$Label)
     # close out the previous step with its duration
     if ($script:StepMarks.Count) {
         $last = $script:StepMarks[$script:StepMarks.Count - 1]
-        Write-Host ("      took {0:mm\:ss}" -f ($sw.Elapsed - $last.At)) -ForegroundColor DarkGray
+        Write-Host ("      took " + (Format-Span ($sw.Elapsed - $last.At))) -ForegroundColor DarkGray
     }
     $script:StepMarks.Add([PSCustomObject]@{ Label = $Label; At = $sw.Elapsed })
-    Write-Host ("`n{0}   (elapsed so far {1:mm\:ss})" -f $Label, $sw.Elapsed) -ForegroundColor Yellow
+    Write-Host ("`n" + $Label + "   (elapsed so far " + (Format-Span $sw.Elapsed) + ")") -ForegroundColor Yellow
 }
 
 function Complete-LastStep {
     if ($script:StepMarks.Count) {
         $last = $script:StepMarks[$script:StepMarks.Count - 1]
-        Write-Host ("      took {0:mm\:ss}" -f ($sw.Elapsed - $last.At)) -ForegroundColor DarkGray
+        Write-Host ("      took " + (Format-Span ($sw.Elapsed - $last.At))) -ForegroundColor DarkGray
     }
 }
 
@@ -482,25 +504,38 @@ $complete = (@($stillMissing).Count -eq 0 -and @($linkFailures).Count -eq 0)
 $missingNames = @($stillMissing | ForEach-Object { [string]$_.DisplayName })
 $failedOus = @($linkFailures | ForEach-Object { [string]$_ })
 
-$meta = [PSCustomObject]@{
-    Domain         = $Domain
-    Server         = $Server
-    BaseDn         = $baseDn
-    DomainSid      = $domSid
-    CollectedAt    = $startedAt.ToString('yyyy-MM-dd HH:mm:ss')
-    FinishedAt     = $finishedAt.ToString('yyyy-MM-dd HH:mm:ss')
-    ElapsedSec     = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-    CollectedBy    = "$env:USERNAME on $env:COMPUTERNAME"
-    OuCount        = @($ous).Count
-    LinkCount      = @($links | Where-Object DisplayName).Count
-    GpoCount       = @($gpos).Count
-    PermCount      = @($perms).Count
-    AceCount       = @($aces).Count
-    GroupCount     = @($applyGroups).Count
-    Complete       = $complete
-    MissingAclGpos = ($missingNames -join '; ')
-    FailedLinkOus  = ($failedOus -join '; ')
+# Built field by field: a single bad value would otherwise kill the whole
+# object, and the exception alone does not say which property caused it.
+$metaFields = [ordered]@{}
+$metaSpec = @(
+    @{ Name = 'Domain'; Get = { [string]$Domain } }
+    @{ Name = 'Server'; Get = { [string]$Server } }
+    @{ Name = 'BaseDn'; Get = { [string]$baseDn } }
+    @{ Name = 'DomainSid'; Get = { [string]$domSid } }
+    @{ Name = 'CollectedAt'; Get = { $startedAt.ToString('yyyy-MM-dd HH:mm:ss') } }
+    @{ Name = 'FinishedAt'; Get = { $finishedAt.ToString('yyyy-MM-dd HH:mm:ss') } }
+    @{ Name = 'ElapsedSec'; Get = { [double][math]::Round($sw.Elapsed.TotalSeconds, 1) } }
+    @{ Name = 'CollectedBy'; Get = { [string]("$env:USERNAME on $env:COMPUTERNAME") } }
+    @{ Name = 'OuCount'; Get = { [int]@($ous).Count } }
+    @{ Name = 'LinkCount'; Get = { [int]@($links | Where-Object { $_.DisplayName }).Count } }
+    @{ Name = 'GpoCount'; Get = { [int]@($gpos).Count } }
+    @{ Name = 'PermCount'; Get = { [int]$perms.Count } }
+    @{ Name = 'AceCount'; Get = { [int]$aces.Count } }
+    @{ Name = 'GroupCount'; Get = { [int]@($applyGroups).Count } }
+    @{ Name = 'Complete'; Get = { [bool]$complete } }
+    @{ Name = 'MissingAclGpos'; Get = { [string]($missingNames -join '; ') } }
+    @{ Name = 'FailedLinkOus'; Get = { [string]($failedOus -join '; ') } }
+)
+
+foreach ($f in $metaSpec) {
+    try { $metaFields[$f.Name] = & $f.Get }
+    catch {
+        $metaFields[$f.Name] = 'ERROR'
+        Write-Warning "meta field '$($f.Name)': $($_.Exception.Message)"
+    }
 }
+
+$meta = [PSCustomObject]$metaFields
 try { [void](Out-Table $meta 'meta') }
 catch { Write-Warning "Could not write meta.csv: $($_.Exception.Message)" }
 
@@ -540,7 +575,7 @@ try {
         $from = [TimeSpan]$script:StepMarks[$n].At
         $to = if ($n + 1 -lt $script:StepMarks.Count) { [TimeSpan]$script:StepMarks[$n + 1].At } else { $sw.Elapsed }
         $dur = $to - $from
-        Write-Host ("  {0,-30} {1}" -f [string]$script:StepMarks[$n].Label, $dur.ToString('mm\:ss'))
+        Write-Host ("  {0,-30} {1}" -f [string]$script:StepMarks[$n].Label, (Format-Span $dur))
     }
 }
 catch { Write-Warning "Timing table: $($_.Exception.Message)" }
@@ -548,8 +583,8 @@ Write-Host ""
 Write-Host ("=" * 52) -ForegroundColor Cyan
 Write-Host ("  Started:       " + $startedAt.ToString('yyyy-MM-dd HH:mm:ss'))
 Write-Host ("  Finished:      " + $finishedAt.ToString('yyyy-MM-dd HH:mm:ss'))
-Write-Host ("  Total elapsed: " + $sw.Elapsed.ToString('hh\:mm\:ss') +
-    "  (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + " sec)") -ForegroundColor Green
+Write-Host ("  Total elapsed: " + (Format-Span $sw.Elapsed) +
+    "  (" + [math]::Round($sw.Elapsed.TotalMinutes, 1) + " min)") -ForegroundColor Green
 Write-Host ("=" * 52) -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Next step:  .\Analyze-GpoMap.ps1 -Path '$OutDir'" -ForegroundColor Cyan

@@ -95,7 +95,17 @@ $perms = $d.permissions
 $aces = $d.applyaces
 $members = $d.groupmembers
 $meta = if ($d.meta.Count) { $d.meta[0] } else { $null }
-$domSid = if ($meta) { $meta.DomainSid } else { $null }
+$domSid = $null
+if ($meta -and $meta.PSObject.Properties.Name -contains 'DomainSid') { $domSid = $meta.DomainSid }
+if (-not $domSid) {
+    # meta.csv missing or older format: the most common S-1-5-21 prefix
+    # across all ACLs is this domain
+    $pref = $perms |
+    Where-Object { $_.TrusteeSid -like 'S-1-5-21-*' } |
+    ForEach-Object { ($_.TrusteeSid -split '-')[0..6] -join '-' } |
+    Group-Object | Sort-Object Count -Descending
+    if ($pref) { $domSid = $pref[0].Name }
+}
 
 Write-Host "`n=== GPO analysis: $Domain ===" -ForegroundColor Cyan
 if ($meta) {
@@ -131,8 +141,11 @@ else {
     Add-Finding 'DataQuality' 'high' 'incomplete export' "$($noAcl.Count) policies without ACL data"
 }
 
+if (-not $meta) {
+    Write-Finding "meta.csv missing - domain SID derived from the ACL data" 'warn'
+}
 if (-not $domSid) {
-    Write-Finding "No DomainSid in meta - orphaned SID detection will be approximate" 'warn'
+    Write-Finding "Domain SID unknown - orphaned SID detection will be approximate" 'warn'
 }
 if ($aces.Count -eq 0) {
     Write-Finding "No applyaces.csv - Deny exclusions cannot be analysed" 'warn'
@@ -220,7 +233,24 @@ $noRead = $byGpo | Where-Object {
             $_.TrusteeSid -eq $AUTH_USERS_SID -or $_.TrusteeSid -like "*$DOM_COMPUTERS_RID"
         })
 }
-$ms16072 = $noRead | Where-Object { $hasUserSide[$_.Name] }
+# A policy is only at MS16-072 risk if the COMPUTER cannot read it.
+# Membership in the Apply group already grants Read, so when that group
+# holds computer accounts the machine can fetch the user half itself.
+function Test-ComputerCanRead {
+    param($GpoGroup)
+    $applying = $GpoGroup.Group | Where-Object { $_.Applies -eq 'True' }
+    foreach ($a in $applying) {
+        $k = Get-Kind $a.Trustee
+        if ($k -eq 'computers' -or $k -eq 'mixed') { return $true }
+        # Domain Computers and similar built-ins are computer principals
+        if ($a.TrusteeSid -like "*$DOM_COMPUTERS_RID") { return $true }
+    }
+    return $false
+}
+
+$riskCandidates = $noRead | Where-Object { $hasUserSide[$_.Name] }
+$ms16072 = $riskCandidates | Where-Object { -not (Test-ComputerCanRead $_) }
+$coveredByGroup = $riskCandidates | Where-Object { Test-ComputerCanRead $_ }
 $noReadCompOnly = $noRead | Where-Object { -not $hasUserSide[$_.Name] }
 
 Write-Finding "Filtered to groups: $(@($groupFiltered).Count)"
@@ -259,6 +289,18 @@ if ($ms16072) {
     }
 }
 else { Write-Finding "MS16-072 risk: none" 'ok' }
+
+if ($coveredByGroup) {
+    Write-Host ""
+    Write-Finding "No Read for Authenticated Users, but the Apply group holds computers"
+    Write-Finding "so the machine can read the policy itself - not at risk:"
+    foreach ($x in $coveredByGroup) {
+        $ap = $x.Group | Where-Object { $_.Applies -eq 'True' }
+        $who = @($ap.Trustee) -join ', '
+        $kinds = (@($ap.Trustee | ForEach-Object { Get-Kind $_ })) -join '/'
+        Write-Finding "    $($x.Name) -> $who [$kinds]"
+    }
+}
 
 if ($noReadCompOnly) {
     Write-Host ""
@@ -383,6 +425,34 @@ if ($localUnresolved.Count) {
     Add-Finding 'DataQuality' 'low' 'name resolution' "$(@($localUnresolved).Count) own-domain SIDs unresolved"
 }
 
+# Users sitting in a group that only ever gates computer-side policies
+# do nothing at all, but they make the group look like it excludes people.
+$compOnlyGroups = @{}
+foreach ($row in ($perms | Where-Object { $_.Applies -eq 'True' })) {
+    if (-not $hasUserSide[$row.Gpo]) {
+        if (-not $compOnlyGroups.ContainsKey($row.Trustee)) { $compOnlyGroups[$row.Trustee] = $true }
+    }
+    else { $compOnlyGroups[$row.Trustee] = $false }
+}
+foreach ($row in $aces) {
+    if (-not $hasUserSide[$row.Gpo]) {
+        if (-not $compOnlyGroups.ContainsKey($row.Trustee)) { $compOnlyGroups[$row.Trustee] = $true }
+    }
+    else { $compOnlyGroups[$row.Trustee] = $false }
+}
+
+$strayUsers = $members |
+Where-Object { $_.MemberClass -eq 'user' -and $compOnlyGroups[$_.GroupName] -eq $true } |
+Group-Object GroupName
+
+Write-Finding "User accounts in computer-only filter groups: $(@($strayUsers).Count) groups" $(if (@($strayUsers).Count) { 'warn' } else { 'ok' })
+foreach ($g in $strayUsers) {
+    $who = (@($g.Group.MemberName) -join ', ')
+    Write-Finding "    $($g.Name): $($g.Group.Count) user(s) - $who" 'warn'
+    Write-Finding "      these accounts have no effect; the group only gates computer policies" 'info'
+    Add-Finding 'Hygiene' 'medium' $g.Name "$($g.Group.Count) user accounts in a computer-only filter group"
+}
+
 $halfCandidates = $gpos | Where-Object {
     ($_.GpoStatus -eq 'AllSettingsEnabled') -and
     (([int]$_.UserVersionAD -eq 0) -or ([int]$_.ComputerVersionAD -eq 0))
@@ -434,21 +504,89 @@ if ($ComparePath) {
         Write-Finding "    ~ $($c.DisplayName)  $($oldVer[$c.DisplayName]) -> $($c.UserVersionAD)/$($c.ComputerVersionAD)" 'warn'
     }
 
+    # ---- links ----
     $oldLinks = @($p.links | Where-Object DisplayName | ForEach-Object { "$($_.Target)|$($_.DisplayName)" })
     $newLinks = @($links | ForEach-Object { "$($_.Target)|$($_.DisplayName)" })
-    foreach ($a in ($newLinks | Where-Object { $oldLinks -notcontains $_ })) { Write-Finding "    + link $a" 'warn' }
-    foreach ($r in ($oldLinks | Where-Object { $newLinks -notcontains $_ })) { Write-Finding "    - link $r" 'warn' }
+    $linkAdd = @($newLinks | Where-Object { $oldLinks -notcontains $_ })
+    $linkDel = @($oldLinks | Where-Object { $newLinks -notcontains $_ })
+    Write-Finding "Links added:   $($linkAdd.Count)"
+    foreach ($a in $linkAdd) { Write-Finding "    + $a" 'warn' }
+    Write-Finding "Links removed: $($linkDel.Count)"
+    foreach ($r in $linkDel) { Write-Finding "    - $r" 'warn' }
 
-    $oldApply = @($p.permissions | Where-Object { $_.Applies -eq 'True' } | ForEach-Object { "$($_.Gpo)|$($_.Trustee)" })
-    $newApply = @($perms | Where-Object { $_.Applies -eq 'True' } | ForEach-Object { "$($_.Gpo)|$($_.Trustee)" })
-    foreach ($a in ($newApply | Where-Object { $oldApply -notcontains $_ })) { Write-Finding "    + apply $a" 'warn' }
-    foreach ($r in ($oldApply | Where-Object { $newApply -notcontains $_ })) { Write-Finding "    - apply $r" 'warn' }
+    # ---- permissions: EVERY permission level, not just Apply ----
+    # A Read grant is invisible in an Apply-only diff, yet it decides
+    # whether a user-side policy works at all (MS16-072).
+    $oldPerm = @{}
+    foreach ($x in $p.permissions) { $oldPerm["$($x.Gpo)|$($x.Trustee)"] = $x.Permission }
+    $newPerm = @{}
+    foreach ($x in $perms) { $newPerm["$($x.Gpo)|$($x.Trustee)"] = $x.Permission }
 
+    $permAdd = @($newPerm.Keys | Where-Object { -not $oldPerm.ContainsKey($_) })
+    $permDel = @($oldPerm.Keys | Where-Object { -not $newPerm.ContainsKey($_) })
+    $permMod = @($newPerm.Keys | Where-Object {
+            $oldPerm.ContainsKey($_) -and $oldPerm[$_] -ne $newPerm[$_]
+        })
+
+    Write-Finding "Permission entries added:   $($permAdd.Count)"
+    foreach ($a in $permAdd) {
+        $lvl = $newPerm[$a]
+        $note = if ($lvl -match 'Apply') { ' <-- now applies' } else { '' }
+        Write-Finding "    + $a = $lvl$note" 'warn'
+    }
+    Write-Finding "Permission entries removed: $($permDel.Count)"
+    foreach ($r in $permDel) { Write-Finding "    - $r = $($oldPerm[$r])" 'warn' }
+    Write-Finding "Permission levels changed:  $($permMod.Count)"
+    foreach ($m in $permMod) {
+        Write-Finding "    ~ $m : $($oldPerm[$m]) -> $($newPerm[$m])" 'warn'
+    }
+
+    # ---- deny ACEs ----
     if ($p.applyaces.Count -and $aces.Count) {
         $oldDeny = @($p.applyaces | Where-Object { $_.AceType -eq 'Deny' } | ForEach-Object { "$($_.Gpo)|$($_.Trustee)" })
         $newDeny = @($aces | Where-Object { $_.AceType -eq 'Deny' } | ForEach-Object { "$($_.Gpo)|$($_.Trustee)" })
-        foreach ($a in ($newDeny | Where-Object { $oldDeny -notcontains $_ })) { Write-Finding "    + deny $a" 'warn' }
-        foreach ($r in ($oldDeny | Where-Object { $newDeny -notcontains $_ })) { Write-Finding "    - deny $r" 'warn' }
+        $denyAdd = @($newDeny | Where-Object { $oldDeny -notcontains $_ })
+        $denyDel = @($oldDeny | Where-Object { $newDeny -notcontains $_ })
+        Write-Finding "Deny ACEs added:   $($denyAdd.Count)"
+        foreach ($a in $denyAdd) { Write-Finding "    + $a" 'warn' }
+        Write-Finding "Deny ACEs removed: $($denyDel.Count)"
+        foreach ($r in $denyDel) { Write-Finding "    - $r" 'warn' }
+    }
+
+    # ---- filter group membership ----
+    if ($p.groupmembers.Count -and $members.Count) {
+        $oldMem = @($p.groupmembers | Where-Object MemberDn | ForEach-Object { "$($_.GroupName)|$($_.MemberName)" })
+        $newMem = @($members | Where-Object MemberDn | ForEach-Object { "$($_.GroupName)|$($_.MemberName)" })
+        $memAdd = @($newMem | Where-Object { $oldMem -notcontains $_ })
+        $memDel = @($oldMem | Where-Object { $newMem -notcontains $_ })
+        if ($memAdd.Count -or $memDel.Count) {
+            Write-Finding "Filter group membership changes: $($memAdd.Count + $memDel.Count)"
+            foreach ($a in $memAdd) { Write-Finding "    + $a" 'warn' }
+            foreach ($r in $memDel) { Write-Finding "    - $r" 'warn' }
+        }
+        else { Write-Finding "Filter group membership: unchanged" }
+    }
+
+    # ---- did any MS16-072 risk appear or clear? ----
+    $oldByGpo = $p.permissions | Group-Object Gpo
+    $oldUserSide = @{}
+    foreach ($g in $p.gpo) { $oldUserSide[$g.DisplayName] = ([int]$g.UserVersionAD -gt 0) }
+    $oldRisk = @($oldByGpo | Where-Object {
+            $oldUserSide[$_.Name] -and -not ($_.Group | Where-Object {
+                    $_.TrusteeSid -eq $AUTH_USERS_SID -or $_.TrusteeSid -like "*$DOM_COMPUTERS_RID"
+                })
+        } | Select-Object -Expand Name)
+    $newRisk = @($ms16072 | Select-Object -Expand Name)
+    $cleared = @($oldRisk | Where-Object { $newRisk -notcontains $_ })
+    $appeared = @($newRisk | Where-Object { $oldRisk -notcontains $_ })
+    if ($cleared) {
+        Write-Finding "MS16-072 risk CLEARED since baseline: $($cleared.Count)" 'ok'
+        foreach ($c in $cleared) { Write-Finding "    fixed: $c" 'ok' }
+    }
+    if ($appeared) {
+        Write-Finding "MS16-072 risk APPEARED since baseline: $($appeared.Count)" 'high'
+        foreach ($a in $appeared) { Write-Finding "    new: $a" 'high' }
+        foreach ($a in $appeared) { Add-Finding 'Filtering' 'high' $a 'MS16-072 risk introduced since the baseline run' }
     }
 }
 

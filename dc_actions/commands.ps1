@@ -17,6 +17,7 @@ C:\gpo-export\nnn.html -Encoding utf8
 #Copy to local machine
 Copy-Item \\dc-nnn.nnn.lo\c$\gpo-export\nnn.xml C:\gpo-export\
 Copy-Item \\dc-nnn.nnn.lo\c$\gpo-export\nnn.html C:\gpo-export\
+copy-item \\dc-nnn.nnn.lo\c$\gpo-export\2026-08-12 c:\gpo-export\ -recurse
 ########################################################################
 
 #По другим доменам — с параметрами:
@@ -36,6 +37,16 @@ Get-ChildItem . -Filter *.ps1 | Unblock-File
 
 .\run-gpo.ps1
 .\run-gpo.ps1 -domain kkk.lo -server dc-iiii.kkk.lo
+########################################################################
 
+#Git
 git diff --staged > staged_changes.diff
+########################################################################
 
+#Правка политик
+get-gppermission -name 'User - Chrome_unblock_settings' -domain nnn.lo -server dc-nnn.nnn.lo -all | export-csv c:\gpo-export\chrome-unblock-after.csv -notypeinformation
+########################################################################
+
+#Загрузка скриптов на DC
+copy-item c:\users\adm\documents\projects\innosoft\dc_actions \\dc-nnn.nnn.lo\c$\scripts\ -recurse -force
+get-childitem c:\scripts\dc_actions -recurse | unblock-file
