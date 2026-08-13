@@ -56,8 +56,8 @@ function Import-Set {
     }
     $set = @{ Domain = $Dom }
     foreach ($part in 'dcs', 'fsmo', 'replication', 'backup', 'sites', 'subnets',
-        'sitelinks', 'privileged', 'domaininfo', 'delegation', 'spn',
-        'adhealth-meta') {
+                      'sitelinks', 'privileged', 'domaininfo', 'delegation', 'spn',
+                      'adhealth-meta') {
         $file = Join-Path $Folder "$Dom-$part.csv"
         if (Test-Path $file) {
             $rows = @(Import-Csv $file)
@@ -110,7 +110,9 @@ foreach ($part in 'dcs', 'fsmo', 'sites', 'privileged', 'domaininfo') {
     }
 }
 if (-not $d.replication.Count) {
-    Write-Finding "No replication data - repadmin was unavailable, run on a DC" 'warn'
+    Write-Finding "No replication data. Either repadmin was unavailable, or it ran" 'warn'
+    Write-Finding "and every partner failed to answer - check the collection log." 'warn'
+    Add-Finding 'DataQuality' 'medium' 'replication' 'no replication data collected'
 }
 if ($d.dcs.Count -and $d.replication.Count) { Write-Finding "All expected files present" 'ok' }
 
@@ -148,6 +150,12 @@ if ($gcs.Count -eq 0) {
 }
 
 foreach ($dc in $dcs) {
+    # Evaluation media stops working after 180 days: the server begins
+    # shutting itself down every hour. Never appropriate for a controller.
+    if ($dc.OperatingSystem -like '*Evaluation*') {
+        Write-Finding "    $($dc.Name): EVALUATION edition - expires and starts shutting down" 'high'
+        Add-Finding 'Controllers' 'high' $dc.Name "runs an evaluation edition: $($dc.OperatingSystem)"
+    }
     foreach ($p in $EOL_PATTERNS) {
         if ($dc.OperatingSystem -like "*$p*") {
             Write-Finding "    $($dc.Name): $($dc.OperatingSystem) is out of support" 'high'
@@ -157,7 +165,12 @@ foreach ($dc in $dcs) {
     if ($dc.LastLogon) {
         try {
             $age = [int]((Get-Date) - [datetime]$dc.LastLogon).TotalDays
-            if ($age -gt 30) {
+            if ($age -gt 90) {
+                Write-Finding "    $($dc.Name): last logon $age days ago - this controller is not working" 'high'
+                Write-Finding "      Clients that should use it are authenticating elsewhere, probably over the WAN." 'high'
+                Add-Finding 'Controllers' 'high' $dc.Name "no logon for $age days, effectively offline"
+            }
+            elseif ($age -gt 30) {
                 Write-Finding "    $($dc.Name): last logon $age days ago - is it still alive?" 'warn'
                 Add-Finding 'Controllers' 'medium' $dc.Name "no logon for $age days"
             }
@@ -175,7 +188,7 @@ $dcNames = @($dcs.Name)
 foreach ($f in $d.fsmo) {
     $known = $dcNames -contains $f.Holder
     Write-Finding ("    {0,-22} {1}{2}" -f $f.Role, $f.Holder, $(if (-not $known) { '   <-- not in the DC list' } else { '' })) `
-    $(if ($known) { 'info' } else { 'high' })
+        $(if ($known) { 'info' } else { 'high' })
     if (-not $known) { Add-Finding 'FSMO' 'high' $f.Role "holder $($f.Holder) is not a live DC" }
 }
 
@@ -194,7 +207,7 @@ Write-Section 'Replication'
 if ($d.replication.Count) {
     $failing = @($d.replication | Where-Object { [int]$_.Failures -gt 0 })
     Write-Finding "Partner links: $(@($d.replication).Count), failing: $($failing.Count)" `
-    $(if ($failing.Count) { 'high' } else { 'ok' })
+        $(if ($failing.Count) { 'high' } else { 'ok' })
 
     foreach ($r in $failing) {
         Write-Finding "    $($r.DestinationDsa) <- $($r.SourceDsa)" 'high'
@@ -217,7 +230,7 @@ if ($d.replication.Count) {
         catch { }
     }
     Write-Finding "Partners with no success in $ReplStaleHours+ hours: $($stale.Count)" `
-    $(if ($stale.Count) { 'warn' } else { 'ok' })
+        $(if ($stale.Count) { 'warn' } else { 'ok' })
     foreach ($s in $stale) {
         Write-Finding "    $($s.Link) - $($s.Hours)h ago  [$($s.Nc)]" 'warn'
         Add-Finding 'Replication' 'medium' $s.Link "no successful replication for $($s.Hours) hours"
@@ -309,7 +322,7 @@ foreach ($g in $byGroup) {
         if (-not $m.LastLogon) { $flags += 'never logged on' }
         $note = if ($flags) { '   <-- ' + ($flags -join ', ') } else { '' }
         Write-Finding ("        {0,-24} {1}{2}" -f $m.Member, $m.Class, $note) `
-        $(if ($flags) { 'warn' } else { 'info' })
+            $(if ($flags) { 'warn' } else { 'info' })
     }
 }
 
@@ -326,6 +339,13 @@ foreach ($m in ($priv | Where-Object { $_.LastLogonDaysAgo -and [int]$_.LastLogo
 foreach ($m in ($priv | Where-Object { $_.PasswordNeverExpires -eq 'True' -and $_.Class -eq 'user' })) {
     Add-Finding 'Privileged' 'medium' $m.Member "privileged account with a non-expiring password (group: $($m.Group))"
 }
+foreach ($m in ($priv | Where-Object { $_.Class -eq 'foreignSecurityPrincipal' })) {
+    $who = if ($m.Member) { $m.Member } else { $m.DistinguishedName }
+    Write-Finding "Cross-domain principal in $($m.Group): $who" 'high'
+    Write-Finding "  A security principal from another domain holds administrative rights here." 'info'
+    Add-Finding 'Privileged' 'high' $who "foreign principal with rights in $($m.Group)"
+}
+
 foreach ($m in ($priv | Where-Object { $_.Enabled -ne 'True' -and $_.Class -eq 'user' })) {
     Add-Finding 'Privileged' 'high' $m.Member "DISABLED account still a member of $($m.Group) - re-enabling it restores full rights"
 }
@@ -359,7 +379,7 @@ Write-Section 'Domain settings'
 if ($info) {
     Write-Finding "Domain functional level: $($info.DomainFunctionLevel)   forest: $($info.ForestFunctionLevel)"
     Write-Finding "Recycle Bin enabled: $($info.RecycleBinEnabled)" `
-    $(if ($info.RecycleBinEnabled -eq 'True') { 'ok' } else { 'warn' })
+        $(if ($info.RecycleBinEnabled -eq 'True') { 'ok' } else { 'warn' })
     if ($info.RecycleBinEnabled -ne 'True') {
         Write-Finding "  Without it, a deleted OU or user needs an authoritative restore." 'info'
         Add-Finding 'Domain' 'medium' $Domain 'AD Recycle Bin is not enabled'

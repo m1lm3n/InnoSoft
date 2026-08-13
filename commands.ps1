@@ -64,3 +64,14 @@ get-gppermission -name 'User - Chrome_unblock_settings' -domain nnn.lo -server d
 Stop-Service Spooler -Force
 Set-Service Spooler -StartupType Disabled
 ########################################################################
+
+$s = New-PSSession -ComputerName dc-kkk.kkk.lo
+Invoke-Command -Session $s -ScriptBlock {
+    Set-Location C:\scripts
+    .\run-gpo.ps1        -Domain kkk.lo -Server dc-kkk.kkk.lo -Root C:\gpo-export\kkk
+    .\run-adhealth.ps1   -Domain kkk.lo -Server dc-kkk.kkk.lo -Root C:\ad-export\kkk
+    .\run-adsecurity.ps1 -Domain kkk.lo -Server dc-kkk.kkk.lo -Root C:\ad-export\kkk
+}
+Copy-Item -FromSession $s -Path C:\gpo-export\kkk -Destination c:\gpo-export\ -Recurse
+Copy-Item -FromSession $s -Path C:\ad-export\kkk -Destination c:\ad-export\ -Recurse
+Remove-PSSession $s
