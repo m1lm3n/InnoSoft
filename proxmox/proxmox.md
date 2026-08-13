@@ -1,2 +1,2 @@
 CV4PVE-Diag
-cv4pve-report
+CV4PVE-Report

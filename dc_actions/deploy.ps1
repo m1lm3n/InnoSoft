@@ -65,10 +65,10 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------
 $Targets = [ordered]@{
     'nnn.lo'     = @{ Server = 'dc-nnn.nnn.lo'; Note = 'users: reten, conversion, sales' }
-    'kkk.lo'     = @{ Server = 'dc-iiii.kkk.lo'; Note = 'scouts, operators - admin Anton' }
-    'xxx.lo'     = @{ Server = 'dc-iiii.xxx.lo'; Note = 'admin Silver' }
-    'ttt.lo'     = @{ Server = 'dc-iiii.ttt.lo'; Note = 'single DC, fault tolerant' }
-    'a.lo'       = @{ Server = 'iiii.a.lo'; Note = 'auth for OnlyOffice and Nextcloud' }
+    'kkk.lo'     = @{ Server = 'dc-kkk.kkk.lo'; Note = 'scouts, operators - admin Anton' }
+    'xxx.lo'     = @{ Server = 'dc-xxx.xxx.lo'; Note = 'admin Silver' }
+    'ttt.lo'     = @{ Server = 'dc-ttt.ttt.lo'; Note = 'single DC, fault tolerant' }
+    'a.lo'       = @{ Server = 'dc.a.lo'; Note = 'auth for OnlyOffice and Nextcloud' }
     'core64.com' = @{ Server = 'dc-dc1.core64.com'; Note = 'management domain' }
 }
 

@@ -30,7 +30,15 @@ param(
     [string]$Server = 'dc-nnn.nnn.lo',
     [string]$OutDir = 'C:\ad-export',
     [int]$StaleComputerDays = 90,
+
+    # Additional hosts to probe for hardening settings alongside the DCs.
+    # The CA is the obvious one: it is not a domain controller, so it never
+    # appears in OU=Domain Controllers, yet it holds the flags that decide
+    # whether certificate templates can be bypassed entirely.
+    [string[]]$ExtraHosts = @(),
+
     [switch]$SkipDcConfig,
+    [switch]$SkipCaConfig,
     [switch]$NoZip
 )
 
@@ -186,7 +194,7 @@ $BROAD_RIDS = @('-513', '-515', '-514')                     # Domain Users, Doma
 # ---------------------------------------------------------------
 # 1. Certification authorities
 # ---------------------------------------------------------------
-Write-Step "[1/6] Certification authorities"
+Write-Step "[1/7] Certification authorities"
 
 $cas = @()
 try {
@@ -213,7 +221,7 @@ catch { Write-Warning "CAs: $($_.Exception.Message)" }
 # ---------------------------------------------------------------
 # 2. Certificate templates
 # ---------------------------------------------------------------
-Write-Step "[2/6] Certificate templates"
+Write-Step "[2/7] Certificate templates"
 
 $templates = New-Object System.Collections.Generic.List[object]
 try {
@@ -224,8 +232,8 @@ try {
     $tplRes = Search-Directory -Base "CN=Certificate Templates,$pkiDn" `
         -Filter '(objectClass=pKICertificateTemplate)' `
         -Properties 'cn', 'displayname', 'mspki-certificate-name-flag', 'mspki-enrollment-flag',
-    'mspki-ra-signature', 'pkiextendedkeyusage', 'mspki-certificate-application-policy',
-    'ntsecuritydescriptor', 'whenchanged' -WithDacl
+                    'mspki-ra-signature', 'pkiextendedkeyusage', 'mspki-certificate-application-policy',
+                    'ntsecuritydescriptor', 'whenchanged' -WithDacl
 
     foreach ($r in $tplRes) {
         $cn = Get-Prop $r 'cn'
@@ -273,33 +281,33 @@ try {
         $writers = @($writers | Sort-Object -Unique)
 
         $broadEnroll = @($enrollees | Where-Object {
-                $s = $_
-                ($BROAD_SIDS -contains $s) -or (@($BROAD_RIDS | Where-Object { $s -like "*$_" }).Count -gt 0)
-            })
+            $s = $_
+            ($BROAD_SIDS -contains $s) -or (@($BROAD_RIDS | Where-Object { $s -like "*$_" }).Count -gt 0)
+        })
 
         $templates.Add([PSCustomObject]@{
-                Name                 = $cn
-                DisplayName          = Get-Prop $r 'displayname'
-                Published            = ($published -contains $cn)
-                SuppliesSubject      = $suppliesSubject
-                ManagerApproval      = $managerApproval
-                RaSignatures         = $raSig
-                AllowsAuthentication = $allowsAuth
-                Ekus                 = ($ekus -join '; ')
-                EnrolleeSids         = ($enrollees -join '; ')
-                Enrollees            = (@($enrollees | ForEach-Object { Resolve-Sid $_ }) -join '; ')
-                BroadEnrollment      = ($broadEnroll.Count -gt 0)
-                BroadEnrollees       = (@($broadEnroll | ForEach-Object { Resolve-Sid $_ }) -join '; ')
-                Writers              = (@($writers | ForEach-Object { Resolve-Sid $_ }) -join '; ')
-                WhenChanged          = Get-Prop $r 'whenchanged'
-            })
+            Name             = $cn
+            DisplayName      = Get-Prop $r 'displayname'
+            Published        = ($published -contains $cn)
+            SuppliesSubject  = $suppliesSubject
+            ManagerApproval  = $managerApproval
+            RaSignatures     = $raSig
+            AllowsAuthentication = $allowsAuth
+            Ekus             = ($ekus -join '; ')
+            EnrolleeSids     = ($enrollees -join '; ')
+            Enrollees        = (@($enrollees | ForEach-Object { Resolve-Sid $_ }) -join '; ')
+            BroadEnrollment  = ($broadEnroll.Count -gt 0)
+            BroadEnrollees   = (@($broadEnroll | ForEach-Object { Resolve-Sid $_ }) -join '; ')
+            Writers          = (@($writers | ForEach-Object { Resolve-Sid $_ }) -join '; ')
+            WhenChanged      = Get-Prop $r 'whenchanged'
+        })
     }
 
     [void](Out-Table $templates 'templates')
     $risky = @($templates | Where-Object {
-            $_.Published -and $_.SuppliesSubject -and $_.AllowsAuthentication -and
-            -not $_.ManagerApproval -and $_.RaSignatures -eq 0 -and $_.BroadEnrollment
-        })
+        $_.Published -and $_.SuppliesSubject -and $_.AllowsAuthentication -and
+        -not $_.ManagerApproval -and $_.RaSignatures -eq 0 -and $_.BroadEnrollment
+    })
     Write-Host "  templates: $($templates.Count), published: $(@($templates | Where-Object Published).Count)"
     Write-Host "  templates allowing subject choice + auth + open enrolment: $($risky.Count)" `
         -ForegroundColor $(if ($risky.Count) { 'Red' } else { 'Gray' })
@@ -310,7 +318,7 @@ catch { Write-Warning "Templates: $($_.Exception.Message)" }
 # ---------------------------------------------------------------
 # 3. LAPS coverage
 # ---------------------------------------------------------------
-Write-Step "[3/6] LAPS coverage"
+Write-Step "[3/7] LAPS coverage"
 
 $laps = New-Object System.Collections.Generic.List[object]
 try {
@@ -319,7 +327,7 @@ try {
     $compRes = Search-Directory -Base $baseDn `
         -Filter '(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=8192)))' `
         -Properties 'samaccountname', 'operatingsystem', 'lastlogontimestamp', 'useraccountcontrol',
-    'mslaps-passwordexpirationtime', 'ms-mcs-admpwdexpirationtime', 'distinguishedname'
+                    'mslaps-passwordexpirationtime', 'ms-mcs-admpwdexpirationtime', 'distinguishedname'
 
     foreach ($r in $compRes) {
         $uac = [int](Get-Prop $r 'useraccountcontrol')
@@ -331,15 +339,15 @@ try {
         $expiry = if ($newLaps) { $newLaps } else { $oldLaps }
 
         $laps.Add([PSCustomObject]@{
-                Computer          = Get-Prop $r 'samaccountname'
-                OperatingSystem   = Get-Prop $r 'operatingsystem'
-                LapsFlavour       = $flavour
-                PasswordExpires   = if ($expiry) { $expiry.ToString('yyyy-MM-dd') } else { $null }
-                ExpiredDaysAgo    = if ($expiry -and $expiry -lt (Get-Date)) { [int]((Get-Date) - $expiry).TotalDays } else { $null }
-                Enabled           = (($uac -band 2) -eq 0)
-                LastLogonDaysAgo  = if ($lastOn) { [int]((Get-Date) - $lastOn).TotalDays } else { $null }
-                DistinguishedName = Get-Prop $r 'distinguishedname'
-            })
+            Computer        = Get-Prop $r 'samaccountname'
+            OperatingSystem = Get-Prop $r 'operatingsystem'
+            LapsFlavour     = $flavour
+            PasswordExpires = if ($expiry) { $expiry.ToString('yyyy-MM-dd') } else { $null }
+            ExpiredDaysAgo  = if ($expiry -and $expiry -lt (Get-Date)) { [int]((Get-Date) - $expiry).TotalDays } else { $null }
+            Enabled         = (($uac -band 2) -eq 0)
+            LastLogonDaysAgo = if ($lastOn) { [int]((Get-Date) - $lastOn).TotalDays } else { $null }
+            DistinguishedName = Get-Prop $r 'distinguishedname'
+        })
     }
 
     [void](Out-Table $laps 'laps')
@@ -352,7 +360,7 @@ catch { Write-Warning "LAPS: $($_.Exception.Message)" }
 # ---------------------------------------------------------------
 # 4. Protection of privileged accounts
 # ---------------------------------------------------------------
-Write-Step "[4/6] Privileged account protection"
+Write-Step "[4/7] Privileged account protection"
 
 $protection = New-Object System.Collections.Generic.List[object]
 try {
@@ -379,20 +387,20 @@ try {
     $admRes = Search-Directory -Base $baseDn `
         -Filter '(&(objectCategory=person)(objectClass=user)(adminCount=1))' `
         -Properties 'samaccountname', 'useraccountcontrol', 'admincount', 'lastlogontimestamp',
-    'pwdlastset', 'distinguishedname'
+                    'pwdlastset', 'distinguishedname'
 
     foreach ($r in $admRes) {
         $uac = [int](Get-Prop $r 'useraccountcontrol')
         $name = Get-Prop $r 'samaccountname'
         $lastOn = ConvertFrom-FileTimeSafe (Get-Prop $r 'lastlogontimestamp')
         $protection.Add([PSCustomObject]@{
-                Account             = $name
-                Enabled             = (($uac -band 2) -eq 0)
-                SensitiveNoDelegate = (($uac -band $UAC_NOT_DELEGATED) -ne 0)
-                InProtectedUsers    = ($protUsersMembers -contains $name)
-                LastLogonDaysAgo    = if ($lastOn) { [int]((Get-Date) - $lastOn).TotalDays } else { $null }
-                DistinguishedName   = Get-Prop $r 'distinguishedname'
-            })
+            Account            = $name
+            Enabled            = (($uac -band 2) -eq 0)
+            SensitiveNoDelegate = (($uac -band $UAC_NOT_DELEGATED) -ne 0)
+            InProtectedUsers   = ($protUsersMembers -contains $name)
+            LastLogonDaysAgo   = if ($lastOn) { [int]((Get-Date) - $lastOn).TotalDays } else { $null }
+            DistinguishedName  = Get-Prop $r 'distinguishedname'
+        })
     }
 
     [void](Out-Table $protection 'protection')
@@ -406,7 +414,7 @@ catch { Write-Warning "Protection: $($_.Exception.Message)" }
 # ---------------------------------------------------------------
 # 5. Computer inventory
 # ---------------------------------------------------------------
-Write-Step "[5/6] Computer inventory"
+Write-Step "[5/7] Computer inventory"
 
 $computers = @()
 try {
@@ -423,7 +431,7 @@ catch { Write-Warning "Computers: $($_.Exception.Message)" }
 # ---------------------------------------------------------------
 # 6. Domain controller hardening
 # ---------------------------------------------------------------
-Write-Step "[6/6] Domain controller hardening"
+Write-Step "[6/7] Domain controller hardening"
 
 $dcConfig = New-Object System.Collections.Generic.List[object]
 if ($SkipDcConfig) { Write-Host "  skipped by request" -ForegroundColor DarkGray }
@@ -433,15 +441,28 @@ else {
             -Filter '(objectCategory=computer)' -Properties 'dnshostname'
         $dcHosts = @($dcRes | ForEach-Object { Get-Prop $_ 'dnshostname' } | Where-Object { $_ })
 
-        foreach ($h in $dcHosts) {
+        # CAs are picked up automatically, plus anything passed in by hand
+        $caHosts = @($cas | ForEach-Object { $_.DnsHostName } | Where-Object { $_ })
+        $probeList = @()
+        foreach ($h in $dcHosts) { $probeList += [PSCustomObject]@{ Host = $h; Role = 'DomainController' } }
+        foreach ($h in $caHosts) {
+            if ($dcHosts -notcontains $h) { $probeList += [PSCustomObject]@{ Host = $h; Role = 'CertificationAuthority' } }
+        }
+        foreach ($h in $ExtraHosts) {
+            if (@($probeList.Host) -notcontains $h) { $probeList += [PSCustomObject]@{ Host = $h; Role = 'Extra' } }
+        }
+
+        foreach ($entry in $probeList) {
+            $h = $entry.Host
             $row = [ordered]@{
-                DomainController     = $h
-                SmbSigningRequired   = $null
-                LdapServerIntegrity  = $null
-                LdapChannelBinding   = $null
-                LmCompatibilityLevel = $null
-                PrintSpoolerRunning  = $null
-                Error                = $null
+                DomainController      = $h
+                Role                  = $entry.Role
+                SmbSigningRequired    = $null
+                LdapServerIntegrity   = $null
+                LdapChannelBinding    = $null
+                LmCompatibilityLevel  = $null
+                PrintSpoolerRunning   = $null
+                Error                 = $null
             }
             try {
                 $reg = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine', $h)
@@ -472,12 +493,100 @@ else {
         }
 
         [void](Out-Table $dcConfig 'dcconfig')
-        Write-Host "  controllers probed: $($dcConfig.Count)"
+        Write-Host "  hosts probed: $($dcConfig.Count)  (DC: $(@($dcConfig | Where-Object { $_.Role -eq 'DomainController' }).Count), CA: $(@($dcConfig | Where-Object { $_.Role -eq 'CertificationAuthority' }).Count))"
         foreach ($c in $dcConfig) {
             if ($c.Error) { Write-Host "    $($c.DomainController): $($c.Error)" -ForegroundColor DarkYellow }
         }
     }
     catch { Write-Warning "DC config: $($_.Exception.Message)" }
+}
+
+# ---------------------------------------------------------------
+# 7. Certification authority configuration
+# ---------------------------------------------------------------
+Write-Step "[7/7] CA configuration"
+
+$caConfig = New-Object System.Collections.Generic.List[object]
+if ($SkipCaConfig) { Write-Host "  skipped by request" -ForegroundColor DarkGray }
+elseif (-not @($cas).Count) { Write-Host "  no CA to probe" -ForegroundColor DarkGray }
+else {
+    foreach ($c in $cas) {
+        $h = $c.DnsHostName
+        if (-not $h) { continue }
+
+        $row = [ordered]@{
+            CaName          = $c.Name
+            CaHost          = $h
+            EditFlags       = $null
+            SanBypass       = $null      # EDITF_ATTRIBUTESUBJECTALTNAME2
+            AuditFilter     = $null
+            RequestDisposition = $null
+            Officers        = $null
+            Enrollers       = $null
+            Error           = $null
+        }
+
+        # The policy module flags live in the registry on the CA itself.
+        # EDITF_ATTRIBUTESUBJECTALTNAME2 lets any requester attach an
+        # arbitrary alternative name, which defeats template restrictions.
+        try {
+            $reg = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine', $h)
+            $caRoot = $reg.OpenSubKey('SYSTEM\CurrentControlSet\Services\CertSvc\Configuration')
+            if ($caRoot) {
+                foreach ($sub in $caRoot.GetSubKeyNames()) {
+                    $k = $caRoot.OpenSubKey($sub)
+                    if (-not $k) { continue }
+                    $audit = $k.GetValue('AuditFilter')
+                    if ($null -ne $audit) { $row.AuditFilter = $audit }
+
+                    $pol = $k.OpenSubKey('PolicyModules\CertificateAuthority_MicrosoftDefault.Policy')
+                    if ($pol) {
+                        $ef = $pol.GetValue('EditFlags')
+                        if ($null -ne $ef) {
+                            $row.EditFlags = $ef
+                            # 0x00040000 = EDITF_ATTRIBUTESUBJECTALTNAME2
+                            $row.SanBypass = ((([int]$ef) -band 0x00040000) -ne 0)
+                        }
+                        $rd = $pol.GetValue('RequestDisposition')
+                        if ($null -ne $rd) { $row.RequestDisposition = $rd }
+                    }
+                }
+            }
+            $reg.Close()
+        }
+        catch { $row.Error = $_.Exception.Message }
+
+        # Who may manage the CA. Needs certutil, which lives on the CA and on
+        # any machine with the AD CS tools installed.
+        try {
+            $certutil = Get-Command certutil.exe -ErrorAction SilentlyContinue
+            if ($certutil) {
+                $sec = & certutil.exe -config "$h\$($c.Name)" -getreg CA\Security 2>$null
+                $txt = ($sec | Out-String)
+                $officers = [regex]::Matches($txt, 'Allow.*Manage CA.*?\s+([^\r\n]+)') |
+                    ForEach-Object { $_.Groups[1].Value.Trim() }
+                if ($officers) { $row.Officers = ($officers -join '; ') }
+            }
+        }
+        catch { }
+
+        $caConfig.Add([PSCustomObject]$row)
+    }
+
+    [void](Out-Table $caConfig 'caconfig')
+    Write-Host "  CAs probed: $($caConfig.Count)"
+    foreach ($c in $caConfig) {
+        if ($c.Error) {
+            Write-Host "    $($c.CaHost): $($c.Error)" -ForegroundColor DarkYellow
+            Write-Host "    run on the CA itself:  certutil -getreg policy\EditFlags" -ForegroundColor DarkYellow
+        }
+        elseif ($c.SanBypass -eq $true) {
+            Write-Host "    SAN BYPASS ENABLED on $($c.CaHost) - any request can claim any identity" -ForegroundColor Red
+        }
+        else {
+            Write-Host "    $($c.CaHost): EditFlags $($c.EditFlags), SAN bypass $($c.SanBypass), audit filter $($c.AuditFilter)"
+        }
+    }
 }
 
 # ---------------------------------------------------------------
@@ -488,18 +597,19 @@ $finishedAt = Get-Date
 
 $metaFields = [ordered]@{}
 $metaSpec = @(
-    @{ Name = 'Domain'; Get = { [string]$Domain } }
-    @{ Name = 'Server'; Get = { [string]$Server } }
-    @{ Name = 'DomainSid'; Get = { [string]$domSid } }
-    @{ Name = 'CollectedAt'; Get = { $startedAt.ToString('yyyy-MM-dd HH:mm:ss') } }
-    @{ Name = 'FinishedAt'; Get = { $finishedAt.ToString('yyyy-MM-dd HH:mm:ss') } }
-    @{ Name = 'ElapsedSec'; Get = { [double][math]::Round($sw.Elapsed.TotalSeconds, 1) } }
-    @{ Name = 'CollectedBy'; Get = { [string]("$env:USERNAME on $env:COMPUTERNAME") } }
-    @{ Name = 'CaCount'; Get = { [int]@($cas).Count } }
+    @{ Name = 'Domain';        Get = { [string]$Domain } }
+    @{ Name = 'Server';        Get = { [string]$Server } }
+    @{ Name = 'DomainSid';     Get = { [string]$domSid } }
+    @{ Name = 'CollectedAt';   Get = { $startedAt.ToString('yyyy-MM-dd HH:mm:ss') } }
+    @{ Name = 'FinishedAt';    Get = { $finishedAt.ToString('yyyy-MM-dd HH:mm:ss') } }
+    @{ Name = 'ElapsedSec';    Get = { [double][math]::Round($sw.Elapsed.TotalSeconds, 1) } }
+    @{ Name = 'CollectedBy';   Get = { [string]("$env:USERNAME on $env:COMPUTERNAME") } }
+    @{ Name = 'CaCount';       Get = { [int]@($cas).Count } }
     @{ Name = 'TemplateCount'; Get = { [int]$templates.Count } }
     @{ Name = 'ComputerCount'; Get = { [int]$laps.Count } }
-    @{ Name = 'AdminCount'; Get = { [int]$protection.Count } }
-    @{ Name = 'DcProbed'; Get = { [int]$dcConfig.Count } }
+    @{ Name = 'AdminCount';    Get = { [int]$protection.Count } }
+    @{ Name = 'DcProbed';      Get = { [int]$dcConfig.Count } }
+    @{ Name = 'CaProbed';      Get = { [int]$caConfig.Count } }
 )
 foreach ($f in $metaSpec) {
     try { $metaFields[$f.Name] = & $f.Get }

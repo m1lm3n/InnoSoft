@@ -10,6 +10,11 @@
         .\run-adsecurity.ps1
         .\run-adsecurity.ps1 -domain kkk.lo -server dc-iiii.kkk.lo
         .\run-adsecurity.ps1 -skipdcconfig
+        .\run-adsecurity.ps1 -extrahosts ca.nnn.lo,datasrv.nnn.lo
+        .\run-adsecurity.ps1 -privilegedaccounts adm.vs,olvin,alexdevops
+
+    The CA is probed automatically, -extrahosts is for anything else worth
+    checking, such as a file server holding the FSLogix profiles.
 #>
 
 [CmdletBinding()]
@@ -17,7 +22,10 @@ param(
     [string]$Domain = 'nnn.lo',
     [string]$Server = 'dc-nnn.nnn.lo',
     [string]$Root = 'C:\ad-export',
+    [string[]]$ExtraHosts = @(),
+    [string[]]$PrivilegedAccounts = @(),
     [switch]$SkipDcConfig,
+    [switch]$SkipCaConfig,
     [switch]$SkipAnalyze
 )
 
@@ -30,9 +38,9 @@ $outDir = Join-Path $Root $today
 $previous = $null
 if (Test-Path $Root) {
     $previous = Get-ChildItem $Root -Directory -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' -and $_.Name -ne $today } |
-    Sort-Object Name -Descending |
-    Select-Object -First 1
+        Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' -and $_.Name -ne $today } |
+        Sort-Object Name -Descending |
+        Select-Object -First 1
 }
 
 Write-Host ""
@@ -43,11 +51,14 @@ else { Write-Host "Baseline: none yet, this run becomes the first" -ForegroundCo
 
 $exportArgs = @{ Domain = $Domain; Server = $Server; OutDir = $outDir; NoZip = $true }
 if ($SkipDcConfig) { $exportArgs['SkipDcConfig'] = $true }
+if ($SkipCaConfig) { $exportArgs['SkipCaConfig'] = $true }
+if ($ExtraHosts.Count) { $exportArgs['ExtraHosts'] = $ExtraHosts }
 & (Join-Path $here 'Export-AdSecurity.ps1') @exportArgs
 
 if (-not $SkipAnalyze) {
     $analyzeArgs = @{ Path = $outDir; Domain = $Domain }
     if ($previous) { $analyzeArgs['ComparePath'] = $previous.FullName }
+    if ($PrivilegedAccounts.Count) { $analyzeArgs['PrivilegedAccounts'] = $PrivilegedAccounts }
     & (Join-Path $here 'Analyze-AdSecurity.ps1') @analyzeArgs
 }
 

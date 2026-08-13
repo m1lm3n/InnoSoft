@@ -52,7 +52,8 @@ function Import-Set {
         $Dom = $any.BaseName -replace '-templates$', ''
     }
     $set = @{ Domain = $Dom }
-    foreach ($part in 'ca', 'templates', 'laps', 'protection', 'computers', 'dcconfig', 'adsecurity-meta') {
+    foreach ($part in 'ca', 'caconfig', 'templates', 'laps', 'protection', 'computers',
+                      'dcconfig', 'adsecurity-meta') {
         $file = Join-Path $Folder "$Dom-$part.csv"
         if (Test-Path $file) {
             $rows = @(Import-Csv $file)
@@ -108,6 +109,54 @@ else {
 }
 
 # ---------------------------------------------------------------
+# 1b. CA configuration
+# ---------------------------------------------------------------
+if ($d.caconfig.Count) {
+    Write-Section 'CA configuration'
+    foreach ($c in $d.caconfig) {
+        Write-Finding "$($c.CaName) on $($c.CaHost)"
+        if ($c.Error) {
+            Write-Finding "    could not read the registry: $($c.Error)" 'warn'
+            Write-Finding "    run on the CA:  certutil -getreg policy\EditFlags" 'info'
+            Add-Finding 'CaConfig' 'medium' $c.CaName 'CA registry unreadable, check EditFlags by hand'
+            continue
+        }
+
+        if ($c.SanBypass -eq 'True') {
+            Write-Finding "    EDITF_ATTRIBUTESUBJECTALTNAME2: ENABLED" 'high'
+            Write-Finding "    Any request may attach an arbitrary alternative name, so every" 'high'
+            Write-Finding "    template that issues an authentication certificate becomes an" 'high'
+            Write-Finding "    escalation path regardless of how carefully it is configured." 'high'
+            Write-Finding "    Fix:  certutil -setreg policy\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2" 'info'
+            Write-Finding "    then restart certsvc. Check first what relies on it." 'info'
+            Add-Finding 'CaConfig' 'high' $c.CaName 'EDITF_ATTRIBUTESUBJECTALTNAME2 is enabled'
+        }
+        elseif ($c.SanBypass -eq 'False') {
+            Write-Finding "    EDITF_ATTRIBUTESUBJECTALTNAME2: off" 'ok'
+        }
+
+        # AuditFilter 127 means every event category is audited
+        if ($c.AuditFilter) {
+            $af = [int]$c.AuditFilter
+            Write-Finding "    audit filter: $af" $(if ($af -eq 127) { 'ok' } else { 'warn' })
+            if ($af -ne 127) {
+                Add-Finding 'CaConfig' 'medium' $c.CaName "CA auditing is partial (filter $af, full is 127)"
+            }
+        }
+        else {
+            Write-Finding "    audit filter: not set - certificate issuance is not audited" 'warn'
+            Add-Finding 'CaConfig' 'medium' $c.CaName 'CA auditing is not configured'
+        }
+
+        # 1 = issue immediately, 0 = pend for approval
+        if ($c.RequestDisposition) {
+            Write-Finding "    request disposition: $($c.RequestDisposition)"
+        }
+        if ($c.Officers) { Write-Finding "    CA managers: $($c.Officers)" }
+    }
+}
+
+# ---------------------------------------------------------------
 # 2. Certificate templates
 # ---------------------------------------------------------------
 Write-Section 'Certificate templates'
@@ -123,12 +172,12 @@ else {
     # The classic escalation: the requester names the identity, the certificate
     # can be used to authenticate, and nobody has to approve the request.
     $esc1 = @($pub | Where-Object {
-            $_.SuppliesSubject -eq 'True' -and
-            $_.AllowsAuthentication -eq 'True' -and
-            $_.ManagerApproval -ne 'True' -and
-            [int]$_.RaSignatures -eq 0 -and
-            $_.BroadEnrollment -eq 'True'
-        })
+        $_.SuppliesSubject -eq 'True' -and
+        $_.AllowsAuthentication -eq 'True' -and
+        $_.ManagerApproval -ne 'True' -and
+        [int]$_.RaSignatures -eq 0 -and
+        $_.BroadEnrollment -eq 'True'
+    })
 
     if ($esc1.Count) {
         Write-Host ""
@@ -150,11 +199,11 @@ else {
     # Only interesting when someone outside the admin groups can enrol:
     # SubCA and similar built-ins are admin-only by design.
     $anyPurpose = @($pub | Where-Object {
-            ($_.Ekus -match '2\.5\.29\.37\.0' -or -not $_.Ekus) -and $_.BroadEnrollment -eq 'True'
-        })
+        ($_.Ekus -match '2\.5\.29\.37\.0' -or -not $_.Ekus) -and $_.BroadEnrollment -eq 'True'
+    })
     $anyPurposeAdmin = @($pub | Where-Object {
-            ($_.Ekus -match '2\.5\.29\.37\.0' -or -not $_.Ekus) -and $_.BroadEnrollment -ne 'True'
-        })
+        ($_.Ekus -match '2\.5\.29\.37\.0' -or -not $_.Ekus) -and $_.BroadEnrollment -ne 'True'
+    })
     if ($anyPurpose.Count) {
         Write-Host ""
         Write-Finding "Templates valid for any purpose, open enrolment: $($anyPurpose.Count)" 'high'
@@ -172,7 +221,7 @@ else {
     # Write access on a template is as good as owning it, but only counts
     # when the holder is not already a domain administrator.
     $adminNames = @('Domain Admins', 'Enterprise Admins', 'Administrators', 'SYSTEM',
-        'Schema Admins', 'ENTERPRISE DOMAIN CONTROLLERS')
+                    'Schema Admins', 'ENTERPRISE DOMAIN CONTROLLERS')
     if ($PrivilegedAccounts) { $adminNames += $PrivilegedAccounts }
 
     $writable = @()
@@ -212,16 +261,16 @@ if (-not $laps.Count) {
 }
 else {
     $active = @($laps | Where-Object {
-            $_.Enabled -eq 'True' -and
-            ($null -eq $_.LastLogonDaysAgo -or $_.LastLogonDaysAgo -eq '' -or [int]$_.LastLogonDaysAgo -le $StaleComputerDays)
-        })
+        $_.Enabled -eq 'True' -and
+        ($null -eq $_.LastLogonDaysAgo -or $_.LastLogonDaysAgo -eq '' -or [int]$_.LastLogonDaysAgo -le $StaleComputerDays)
+    })
     $covered = @($active | Where-Object { $_.LapsFlavour -ne 'none' })
     $missing = @($active | Where-Object { $_.LapsFlavour -eq 'none' })
     $expired = @($covered | Where-Object { $_.ExpiredDaysAgo -and [int]$_.ExpiredDaysAgo -gt 7 })
 
     $pct = if ($active.Count) { [math]::Round(100 * $covered.Count / $active.Count, 1) } else { 0 }
     Write-Finding "Active computers: $($active.Count), with LAPS: $($covered.Count)  ($pct%)" `
-    $(if ($pct -ge 90) { 'ok' } elseif ($pct -eq 0) { 'high' } else { 'warn' })
+        $(if ($pct -ge 90) { 'ok' } elseif ($pct -eq 0) { 'high' } else { 'warn' })
 
     if ($covered.Count -eq 0) {
         Write-Finding "  No machine has a LAPS-managed local administrator password." 'high'
@@ -319,7 +368,8 @@ if (-not $dcc.Count) {
 }
 else {
     foreach ($c in $dcc) {
-        Write-Finding "$($c.DomainController)"
+        $role = if ($c.Role) { " [$($c.Role)]" } else { '' }
+        Write-Finding "$($c.DomainController)$role"
         if ($c.Error) {
             Write-Finding "    could not read: $($c.Error)" 'warn'
             continue
@@ -355,8 +405,9 @@ else {
 
         # The spooler on a DC is a well known relay target
         if ($c.PrintSpoolerRunning -eq 'True') {
+            $what = if ($c.Role -eq 'CertificationAuthority') { 'a certification authority' } else { 'a domain controller' }
             Write-Finding "    Print Spooler:          running" 'high'
-            Add-Finding 'DcHardening' 'high' $c.DomainController 'Print Spooler is running on a domain controller'
+            Add-Finding 'DcHardening' 'high' $c.DomainController "Print Spooler is running on $what"
         }
         elseif ($c.PrintSpoolerRunning -eq 'False') {
             Write-Finding "    Print Spooler:          stopped" 'ok'
@@ -380,6 +431,73 @@ if ($ComparePath) {
     }
     foreach ($x in ($oldT | Where-Object { $newT -notcontains $_ })) { Write-Finding "    - template/enrolment $x" 'warn' }
 
+    # --- hardening state: the whole point of running this twice ---
+    $oldCfg = @{}
+    foreach ($x in $p.dcconfig) { $oldCfg[$x.DomainController] = $x }
+    $cfgChanges = 0
+    foreach ($n in $dcc) {
+        if (-not $oldCfg.ContainsKey($n.DomainController)) {
+            Write-Finding "    + host $($n.DomainController)" 'warn'
+            continue
+        }
+        $o = $oldCfg[$n.DomainController]
+        foreach ($field in 'SmbSigningRequired', 'LdapServerIntegrity', 'LdapChannelBinding',
+                           'LmCompatibilityLevel', 'PrintSpoolerRunning') {
+            $ov = "$($o.$field)"; $nv = "$($n.$field)"
+            if ($ov -ne $nv) {
+                $cfgChanges++
+                # spooler stopping is an improvement, starting is not
+                $better = ($field -eq 'PrintSpoolerRunning' -and $nv -eq 'False') -or
+                          ($field -ne 'PrintSpoolerRunning' -and $nv -gt $ov)
+                $lvl = if ($better) { 'ok' } else { 'high' }
+                Write-Finding "    ~ $($n.DomainController) $field : '$ov' -> '$nv'" $lvl
+                if (-not $better) {
+                    Add-Finding 'DcHardening' 'high' $n.DomainController "$field weakened: $ov -> $nv"
+                }
+            }
+        }
+    }
+    Write-Finding "Hardening settings changed: $cfgChanges" $(if ($cfgChanges) { 'warn' } else { 'ok' })
+
+    # --- privileged account protection ---
+    $oldProt = @{}
+    foreach ($x in $p.protection) { $oldProt[$x.Account] = $x }
+    foreach ($n in $prot) {
+        if (-not $oldProt.ContainsKey($n.Account)) {
+            Write-Finding "    + privileged account $($n.Account)" 'high'
+            Add-Finding 'AccountProtection' 'high' $n.Account 'newly flagged as privileged since the baseline'
+            continue
+        }
+        $o = $oldProt[$n.Account]
+        if ($o.InProtectedUsers -ne $n.InProtectedUsers -or $o.SensitiveNoDelegate -ne $n.SensitiveNoDelegate) {
+            Write-Finding "    ~ $($n.Account) protection changed: protected $($o.InProtectedUsers)->$($n.InProtectedUsers), sensitive $($o.SensitiveNoDelegate)->$($n.SensitiveNoDelegate)" 'warn'
+        }
+    }
+    foreach ($o in $p.protection) {
+        if (-not (@($prot.Account) -contains $o.Account)) { Write-Finding "    - privileged account $($o.Account)" }
+    }
+
+    # --- LAPS coverage trend ---
+    $oldCov = @($p.laps | Where-Object { $_.LapsFlavour -ne 'none' }).Count
+    $newCov = @($laps | Where-Object { $_.LapsFlavour -ne 'none' }).Count
+    if ($oldCov -ne $newCov) {
+        $lvl = if ($newCov -gt $oldCov) { 'ok' } else { 'high' }
+        Write-Finding "LAPS coverage: $oldCov -> $newCov computers" $lvl
+    }
+
+    # --- CA flags ---
+    if ($p.caconfig.Count -and $d.caconfig.Count) {
+        $oldCa = @{}
+        foreach ($x in $p.caconfig) { $oldCa[$x.CaName] = $x }
+        foreach ($n in $d.caconfig) {
+            if ($oldCa.ContainsKey($n.CaName) -and $oldCa[$n.CaName].SanBypass -ne $n.SanBypass) {
+                Write-Finding "    ~ $($n.CaName) SAN bypass: $($oldCa[$n.CaName].SanBypass) -> $($n.SanBypass)" 'high'
+                Add-Finding 'CaConfig' 'high' $n.CaName "EDITF_ATTRIBUTESUBJECTALTNAME2 changed to $($n.SanBypass)"
+            }
+        }
+    }
+
+    # --- computers ---
     $oldC = @($p.computers.Computer); $newC = @($comp.Computer)
     Write-Finding "Computers added: $(@($newC | Where-Object { $oldC -notcontains $_ }).Count)"
     Write-Finding "Computers removed: $(@($oldC | Where-Object { $newC -notcontains $_ }).Count)"
