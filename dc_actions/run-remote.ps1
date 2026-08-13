@@ -16,6 +16,41 @@
         .\run-remote.ps1 -all -promptondenied
         .\run-remote.ps1 -list
 
+    Credentials:
+        .\run-remote.ps1 -all -setcredential      # ask once, store encrypted
+        .\run-remote.ps1 -all                     # later runs use the store
+
+    Passwords are encrypted with DPAPI and readable only by the Windows
+    account that saved them, on the machine that saved them. A .env file
+    beside this script may hold USERNAMES only, to prefill the prompt:
+
+        xxx.lo = xxx\adm.olvin
+        ttt.lo = ttt\adm.olvin
+
+    Add .env and the credential store to .gitignore.
+
+    Authentication:
+        Negotiate is the default here. Kerberos, which PowerShell would use
+        on its own, fails when this workstation belongs to a different
+        domain from the controller. Override with -authentication if needed.
+
+    Trusts:
+        core64.com has forest trusts with kkk.lo, xxx.lo, a.lo and c.lo.
+        nnn.lo and ttt.lo are standalone forests with no trust at all, so a
+        workstation in core64.com cannot use Kerberos against them. They are
+        marked Trusted = $false in the target table and need NTLM, which WinRM
+        only permits for hosts listed in TrustedHosts:
+
+            .\run-remote.ps1 -all -ensuretrustedhosts     # elevated console
+            .\run-remote.ps1 -all -ensuretrustedhosts -restoretrustedhosts
+
+        Recheck after any change to the trust layout:
+            nltest /domain_trusts /all_trusts /v
+
+    If a target reports "port closed", the controller is usually showing a
+    Public network profile, which limits WinRM to its own subnet. On the
+    controller: Get-NetConnectionProfile, then Restart-Service NlaSvc -Force.
+
     Results land in <LocalRoot>\<domain>\<date>\ on this machine.
 #>
 
@@ -42,6 +77,35 @@ param(
     [hashtable]$CredentialMap = @{},
     [switch]$PromptOnDenied,
 
+    # Encrypted credential store. Export-Clixml protects the password with
+    # DPAPI, so the file is readable only by this Windows account on this
+    # machine. Never put passwords in a plain .env next to a git repo.
+    [string]$CredentialStore = (Join-Path $env:USERPROFILE '.dc_actions\creds'),
+
+    # Optional plain file holding USERNAMES only, one per line:
+    #     xxx.lo = xxx\adm.olvin
+    #     ttt.lo = ttt\adm.olvin
+    # Used to prefill the prompt so the account never has to be retyped.
+    [string]$EnvFile = (Join-Path $PSScriptRoot '.env'),
+
+    # Prompt for a credential, store it encrypted, then exit
+    [switch]$SetCredential,
+
+    # Add the untrusted controllers to the WinRM TrustedHosts list so NTLM
+    # can be used. Needs an elevated console. See the note near $Targets.
+    [switch]$EnsureTrustedHosts,
+
+    # Put TrustedHosts back the way it was once the run finishes
+    [switch]$RestoreTrustedHosts,
+
+    # Do not read or write the store for this run
+    [switch]$NoCredentialStore,
+
+    # Kerberos is the default and fails when the workstation sits in a
+    # different domain from the target. Negotiate falls back to NTLM.
+    [ValidateSet('Default', 'Kerberos', 'Negotiate', 'CredSSP', 'Basic')]
+    [string]$Authentication = 'Negotiate',
+
     # Leave the working folder on the controller
     [switch]$KeepRemote
 )
@@ -49,15 +113,220 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------
+# Credential handling
+# ---------------------------------------------------------------
+function Get-CredentialPath {
+    param([string]$Dom)
+    $safe = $Dom -replace '[^\w\.\-]', '_'
+    return (Join-Path $CredentialStore "$safe.cred.xml")
+}
+
+function Import-StoredCredential {
+    param([string]$Dom)
+    if ($NoCredentialStore) { return $null }
+    $path = Get-CredentialPath $Dom
+    if (-not (Test-Path $path)) { return $null }
+    try {
+        # Import-Clixml only succeeds for the account that exported it
+        return Import-Clixml -Path $path
+    }
+    catch {
+        Write-Warning "Stored credential for $Dom is unusable: $($_.Exception.Message)"
+        Write-Warning "It was probably created by another account or on another machine."
+        return $null
+    }
+}
+
+function Save-StoredCredential {
+    param([string]$Dom, [System.Management.Automation.PSCredential]$Cred)
+    if ($NoCredentialStore) { return }
+    if (-not (Test-Path $CredentialStore)) {
+        New-Item -ItemType Directory -Path $CredentialStore -Force | Out-Null
+    }
+    $path = Get-CredentialPath $Dom
+    $Cred | Export-Clixml -Path $path -Force
+    Write-Host "  credential stored: $path" -ForegroundColor DarkGray
+}
+
+function Import-EnvUsernames {
+    # "domain = user" pairs, blank lines and # comments ignored
+    $map = @{}
+    if (-not $EnvFile -or -not (Test-Path $EnvFile)) { return $map }
+    foreach ($line in (Get-Content $EnvFile)) {
+        $t = "$line".Trim()
+        if (-not $t -or $t.StartsWith('#')) { continue }
+        $parts = $t -split '=', 2
+        if ($parts.Count -ne 2) { continue }
+        $k = $parts[0].Trim()
+        $v = $parts[1].Trim() -replace '^["'']|["'']$', ''
+        if ($k -and $v) { $map[$k] = $v }
+    }
+    return $map
+}
+
+$envUsers = Import-EnvUsernames
+if ($envUsers.Count) {
+    Write-Host "Loaded $($envUsers.Count) username hint(s) from $EnvFile" -ForegroundColor DarkGray
+}
+
+# ---------------------------------------------------------------
+# TrustedHosts
+#
+# Without a trust, a workstation in core64.com cannot obtain a Kerberos
+# ticket for nnn.lo or ttt.lo. NTLM still works, but WinRM refuses NTLM
+# unless the target is listed in TrustedHosts. Listing a host means the
+# client stops verifying the server identity for that name, so keep the
+# list to specific names and never use a wildcard.
+# ---------------------------------------------------------------
+function Test-IsElevated {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-TrustedHostList {
+    try { return (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction Stop).Value }
+    catch { return $null }
+}
+
+function Add-TrustedHostEntry {
+    param([string[]]$HostNames)
+
+    $current = Get-TrustedHostList
+    $have = @()
+    if ($current) { $have = @($current -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+
+    $missing = @($HostNames | Where-Object { $have -notcontains $_ })
+    if (-not $missing.Count) { return $true }
+
+    if (-not (Test-IsElevated)) {
+        Write-Host "  TrustedHosts needs an elevated console. Run once as administrator:" -ForegroundColor Yellow
+        Write-Host "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value '$($missing -join ',')' -Concatenate -Force" -ForegroundColor Yellow
+        return $false
+    }
+
+    try {
+        Set-Item WSMan:\localhost\Client\TrustedHosts -Value ($missing -join ',') -Concatenate -Force
+        Write-Host "  TrustedHosts extended with: $($missing -join ', ')" -ForegroundColor DarkGray
+        return $true
+    }
+    catch {
+        Write-Host "  could not update TrustedHosts: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function New-TargetSession {
+    <#
+        Opens a PSSession, retrying with a different authentication method
+        when Kerberos fails. A workstation joined to another domain cannot
+        get a Kerberos ticket for the target, but Negotiate falls back to
+        NTLM and usually succeeds.
+    #>
+    param(
+        [string]$Server,
+        [System.Management.Automation.PSCredential]$Cred,
+        [string]$Method = 'Negotiate'
+    )
+
+    $attempts = @($Method)
+    foreach ($fallback in 'Negotiate', 'Default', 'Kerberos', 'Basic') {
+        if ($attempts -notcontains $fallback) { $attempts += $fallback }
+    }
+    # Basic only works over HTTPS or against a TrustedHosts entry; it stays
+    # last so it is tried only when everything else has failed.
+    Write-Verbose "auth order: $($attempts -join ', ')"
+
+    $lastError = $null
+    foreach ($auth in $attempts) {
+        try {
+            $sp = @{ ComputerName = $Server; ErrorAction = 'Stop' }
+            if ($Cred) {
+                $sp['Credential'] = $Cred
+                # Authentication cannot be specified without a credential
+                if ($auth -ne 'Default') { $sp['Authentication'] = $auth }
+            }
+            $session = New-PSSession @sp
+            if ($auth -ne $attempts[0]) {
+                Write-Host "  connected using $auth" -ForegroundColor DarkGray
+            }
+            return $session
+        }
+        catch {
+            $lastError = $_.Exception.Message
+            # Do not pattern-match the message body: the Kerberos failure text
+            # lists "the user name or password specified are invalid" merely as
+            # one of its possible causes, which used to abort the fallback loop
+            # on the very first attempt. Match the actual status codes instead.
+            #   0x8009030C  logon failure, wrong credentials
+            #   0x80090308  account restriction
+            #   0x80090353  account locked out
+            if ($lastError -match '0x8009030C|0x80090308|0x80090353') { break }
+            if ($lastError -match 'Access is denied' -and $auth -ne 'Kerberos') { break }
+        }
+    }
+
+    Write-Verbose "session failed: $lastError"
+    $script:LastSessionError = $lastError
+    return $null
+}
+
+function Resolve-DomainCredential {
+    <#
+        Order of precedence:
+          1. -CredentialMap entry for this domain
+          2. -Credential passed on the command line
+          3. encrypted store
+          4. interactive prompt, only when -PromptOnDenied is set
+    #>
+    param([string]$Dom, [string]$Server, [switch]$Interactive)
+
+    if ($CredentialMap.ContainsKey($Dom)) { return $CredentialMap[$Dom] }
+    if ($Credential) { return $Credential }
+
+    $stored = Import-StoredCredential $Dom
+    if ($stored) {
+        Write-Host "  using stored credential for $($stored.UserName)" -ForegroundColor DarkGray
+        return $stored
+    }
+
+    if (-not $Interactive) { return $null }
+
+    $hint = if ($envUsers.ContainsKey($Dom)) { $envUsers[$Dom] } else { '' }
+    $msg = "Credentials for $Dom ($Server)"
+    $cred = if ($hint) { Get-Credential -Message $msg -UserName $hint } else { Get-Credential -Message $msg }
+    if ($cred) { Save-StoredCredential -Dom $Dom -Cred $cred }
+    return $cred
+}
+
+# ---------------------------------------------------------------
 # Target table - mirror of the one in deploy.ps1
 # ---------------------------------------------------------------
+# Trusted = $false means there is no trust with the management domain, so
+# Kerberos cannot work from a core64.com workstation and WinRM needs NTLM.
+# Verified 13.08.2026 with: nltest /domain_trusts /all_trusts /v
+#   core64.com trusts kkk.lo, xxx.lo, a.lo, c.lo
+#   nnn.lo and ttt.lo are standalone forests with no trust at all
 $Targets = [ordered]@{
-    'nnn.lo'     = @{ Server = 'dc-nnn.nnn.lo'; Note = 'users: reten, conversion, sales' }
-    'kkk.lo'     = @{ Server = 'dc-kkk.kkk.lo'; Note = 'scouts, operators - admin Anton' }
-    'xxx.lo'     = @{ Server = 'dc-xxx.xxx.lo'; Note = 'admin Silver' }
-    'ttt.lo'     = @{ Server = 'dc-ttt.ttt.lo'; Note = 'single DC, fault tolerant' }
-    'a.lo'       = @{ Server = 'dc.a.lo'; Note = 'auth for OnlyOffice and Nextcloud' }
-    'core64.com' = @{ Server = 'dc-dc1.core64.com'; Note = 'management domain' }
+    'nnn.lo'     = @{ Server = 'dc-nnn.nnn.lo'; Trusted = $false
+        Extra = @('dc2-nnn.nnn.lo')
+        Note = 'users: reten, conversion, sales. No trust, NTLM only'
+    }
+    'kkk.lo'     = @{ Server = 'dc-kkk.kkk.lo'; Trusted = $true
+        Note = 'scouts, operators'
+    }
+    'xxx.lo'     = @{ Server = 'dc-xxx.xxx.lo'; Trusted = $true
+        Note = 'admin Silver'
+    }
+    'ttt.lo'     = @{ Server = 'dc-ttt.ttt.lo'; Trusted = $false
+        Note = 'single DC. No trust, NTLM only'
+    }
+    'a.lo'       = @{ Server = 'dc.a.lo'; Trusted = $true
+        Note = 'auth for OnlyOffice and Nextcloud, single DC'
+    }
+    'core64.com' = @{ Server = 'dc-dc1.core64.com'; Trusted = $true
+        Note = 'management domain'
+    }
 }
 
 if ($List) {
@@ -77,6 +346,43 @@ foreach ($dom in $selected) {
     }
 }
 
+# ---------------------------------------------------------------
+# Store credentials and exit
+# ---------------------------------------------------------------
+if ($SetCredential) {
+    foreach ($dom in $selected) {
+        $srv = $Targets[$dom].Server
+        Write-Host ""
+        Write-Host "--- $dom ($srv)" -ForegroundColor Cyan
+        $hint = if ($envUsers.ContainsKey($dom)) { $envUsers[$dom] } else { '' }
+        $c = if ($hint) {
+            Get-Credential -Message "Credentials for $dom ($srv)" -UserName $hint
+        }
+        else {
+            Get-Credential -Message "Credentials for $dom ($srv)"
+        }
+        if ($c) {
+            Save-StoredCredential -Dom $dom -Cred $c
+            # confirm the account actually works before trusting the file
+            $t = New-TargetSession -Server $srv -Cred $c -Method $Authentication
+            if ($t) {
+                Remove-PSSession $t
+                Write-Host "  verified against $srv" -ForegroundColor Green
+            }
+            else {
+                Write-Host "  saved, but the session failed:" -ForegroundColor Yellow
+                Write-Host "  $script:LastSessionError" -ForegroundColor DarkGray
+            }
+        }
+        else { Write-Host "  skipped" -ForegroundColor DarkGray }
+    }
+    Write-Host ""
+    Write-Host "Store: $CredentialStore" -ForegroundColor DarkGray
+    Write-Host "Readable only by $env:USERNAME on $env:COMPUTERNAME." -ForegroundColor DarkGray
+    Write-Host ""
+    return
+}
+
 $toolkits = if ($Only -contains 'all') { @('gpo', 'adhealth', 'adsecurity') } else { $Only }
 $today = (Get-Date).ToString('yyyy-MM-dd')
 
@@ -86,39 +392,108 @@ Write-Host "Results:  $LocalRoot" -ForegroundColor Cyan
 
 $results = New-Object System.Collections.Generic.List[object]
 
+# ---------------------------------------------------------------
+# TrustedHosts for the domains with no trust
+# ---------------------------------------------------------------
+$trustedHostsBefore = Get-TrustedHostList
+$needNtlm = @()
+foreach ($dom in $selected) {
+    if ($Targets[$dom].Trusted -eq $false) {
+        $needNtlm += $Targets[$dom].Server
+        if ($Targets[$dom].Extra) { $needNtlm += $Targets[$dom].Extra }
+    }
+}
+$needNtlm = @($needNtlm | Sort-Object -Unique)
+
+if ($needNtlm.Count) {
+    Write-Host ""
+    Write-Host "No trust with: $(@($selected | Where-Object { $Targets[$_].Trusted -eq $false }) -join ', ')" -ForegroundColor DarkYellow
+    Write-Host "These need NTLM, which WinRM allows only for TrustedHosts entries." -ForegroundColor DarkYellow
+    if ($EnsureTrustedHosts) {
+        [void](Add-TrustedHostEntry -HostNames $needNtlm)
+    }
+    else {
+        $have = @()
+        if ($trustedHostsBefore) { $have = @($trustedHostsBefore -split ',' | ForEach-Object { $_.Trim() }) }
+        $missing = @($needNtlm | Where-Object { $have -notcontains $_ })
+        if ($missing.Count) {
+            Write-Host "Not listed yet: $($missing -join ', ')" -ForegroundColor DarkYellow
+            Write-Host "Add them with -ensuretrustedhosts from an elevated console," -ForegroundColor DarkYellow
+            Write-Host "or once by hand:" -ForegroundColor DarkYellow
+            Write-Host "  Set-Item WSMan:\localhost\Client\TrustedHosts -Value '$($missing -join ',')' -Concatenate -Force" -ForegroundColor DarkYellow
+        }
+    }
+}
+
 foreach ($dom in $selected) {
     $server = $Targets[$dom].Server
+    $trusted = ($Targets[$dom].Trusted -ne $false)
     Write-Host ""
     Write-Host ("--- $dom  ->  $server " + ('-' * [Math]::Max(0, 28 - $dom.Length))) -ForegroundColor Cyan
+    if (-not $trusted) { Write-Host "  no trust with the management domain, using NTLM" -ForegroundColor DarkGray }
 
-    $cred = $null
-    if ($CredentialMap.ContainsKey($dom)) { $cred = $CredentialMap[$dom] }
-    elseif ($Credential) { $cred = $Credential }
+    # map -> command line -> encrypted store; no prompt on the first attempt
+    $cred = Resolve-DomainCredential -Dom $dom -Server $server
 
-    $session = $null
     $status = 'ok'
     $detail = ''
+    $script:LastSessionError = $null
 
-    try {
-        $sessionArgs = @{ ComputerName = $server; ErrorAction = 'Stop' }
-        if ($cred) { $sessionArgs['Credential'] = $cred }
-        $session = New-PSSession @sessionArgs
+    # Check the port first: a closed 5985 is a firewall or a network profile
+    # problem, not a credential one, and the message should say so.
+    $portOpen = Test-NetConnection $server -Port 5985 -InformationLevel Quiet -WarningAction SilentlyContinue
+    if (-not $portOpen) {
+        Write-Host "  port 5985 is closed" -ForegroundColor Red
+        Write-Host "  On the controller check the network profile - a DC showing Public" -ForegroundColor DarkYellow
+        Write-Host "  only accepts WinRM from its own subnet:" -ForegroundColor DarkYellow
+        Write-Host "    Get-NetConnectionProfile" -ForegroundColor DarkYellow
+        Write-Host "    Restart-Service NlaSvc -Force" -ForegroundColor DarkYellow
+        $results.Add([PSCustomObject]@{ Domain = $dom; Server = $server; Status = 'port closed'; Files = 0; Detail = 'WinRM 5985 unreachable' })
+        continue
     }
-    catch {
-        if ($PromptOnDenied -and -not $cred) {
-            Write-Host "  connection refused, asking for credentials" -ForegroundColor DarkYellow
-            try {
-                $cred = Get-Credential -Message "Credentials for $dom ($server)"
-                $session = New-PSSession -ComputerName $server -Credential $cred -ErrorAction Stop
+
+    $session = New-TargetSession -Server $server -Cred $cred -Method $Authentication
+
+    if (-not $session -and $PromptOnDenied) {
+        Write-Host "  refused: $script:LastSessionError" -ForegroundColor DarkYellow
+        # A stored credential that no longer works is worse than none:
+        # drop it so the prompt is not skipped next time.
+        if ($cred -and -not $CredentialMap.ContainsKey($dom) -and -not $Credential) {
+            $stale = Get-CredentialPath $dom
+            if (Test-Path $stale) {
+                Remove-Item $stale -Force -ErrorAction SilentlyContinue
+                Write-Host "  removed the stored credential, it no longer works" -ForegroundColor DarkYellow
             }
-            catch { $session = $null }
         }
+        $cred = Resolve-DomainCredential -Dom $dom -Server $server -Interactive
+        if ($cred) { $session = New-TargetSession -Server $server -Cred $cred -Method $Authentication }
     }
 
     if (-not $session) {
-        Write-Host "  no WinRM session. Check the service and the firewall:" -ForegroundColor Red
-        Write-Host "    Test-WSMan -ComputerName $server" -ForegroundColor DarkYellow
-        $results.Add([PSCustomObject]@{ Domain = $dom; Server = $server; Status = 'no session'; Files = 0; Detail = '' })
+        Write-Host "  no session established" -ForegroundColor Red
+        if ($script:LastSessionError) {
+            Write-Host "  $(($script:LastSessionError -split "`n")[0])" -ForegroundColor DarkGray
+        }
+        if ("$script:LastSessionError" -match '0x80090311') {
+            if (-not $trusted) {
+                Write-Host "  Expected: there is no trust with $dom, so Kerberos cannot work." -ForegroundColor DarkYellow
+                Write-Host "  NTLM needs this host in TrustedHosts. From an elevated console:" -ForegroundColor DarkYellow
+                Write-Host "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value '$server' -Concatenate -Force" -ForegroundColor DarkYellow
+                Write-Host "  or rerun with -ensuretrustedhosts as administrator." -ForegroundColor DarkYellow
+            }
+            else {
+                Write-Host "  Kerberos found no KDC although a trust is expected. Verify it:" -ForegroundColor DarkYellow
+                Write-Host "    nltest /domain_trusts /all_trusts /v" -ForegroundColor DarkYellow
+                Write-Host "    Resolve-DnsName -Type SRV _kerberos._tcp.$dom" -ForegroundColor DarkYellow
+            }
+        }
+        else {
+            Write-Host "  try: .\run-remote.ps1 -domain $dom -setcredential" -ForegroundColor DarkYellow
+        }
+        $results.Add([PSCustomObject]@{
+                Domain = $dom; Server = $server; Status = 'no session'; Files = 0
+                Detail = if ($script:LastSessionError) { ($script:LastSessionError -split "`n")[0] } else { '' }
+            })
         continue
     }
 
@@ -154,7 +529,7 @@ foreach ($dom in $selected) {
         $remoteFiles = Invoke-Command -Session $session -ArgumentList $remoteRoot -ScriptBlock {
             param($root)
             Get-ChildItem $root -Recurse -Filter *.csv -File -ErrorAction SilentlyContinue |
-                Select-Object -Expand FullName
+            Select-Object -Expand FullName
         }
 
         $copied = 0
@@ -186,6 +561,23 @@ foreach ($dom in $selected) {
     finally {
         if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
     }
+}
+
+if ($RestoreTrustedHosts) {
+    if (Test-IsElevated) {
+        try {
+            if ($trustedHostsBefore) {
+                Set-Item WSMan:\localhost\Client\TrustedHosts -Value $trustedHostsBefore -Force
+            }
+            else {
+                Clear-Item WSMan:\localhost\Client\TrustedHosts -Force
+            }
+            Write-Host ""
+            Write-Host "TrustedHosts restored to its previous value" -ForegroundColor DarkGray
+        }
+        catch { Write-Warning "Could not restore TrustedHosts: $($_.Exception.Message)" }
+    }
+    else { Write-Warning "TrustedHosts not restored: needs an elevated console" }
 }
 
 Write-Host ""

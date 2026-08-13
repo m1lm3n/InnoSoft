@@ -3,3 +3,5 @@ VPN_Profile_pritunl/
 planning/
 Creds.txt
 Architecture.md
+.env
+*.cred.xml
