@@ -1,6 +1,9 @@
 #Run as domain user
 runas /netonly /user:kkk\olvin powershell.exe
 ########################################################################
+copy-item \\dc-nnn.nnn.lo\c$\gpo-export\* c:\gpo-export\ -recurse -force
+copy-item \\dc-nnn.nnn.lo\c$\ad-export\* c:\ad-export\ -recurse -force
+########################################################################
 
 #Create report of GPOs in the domain and export to XML
 Import-Module GroupPolicy
@@ -24,8 +27,8 @@ get-childitem c:\scripts\dc_actions -recurse | unblock-file
 Copy-Item \\dc-nnn.nnn.lo\c$\gpo-export\nnn.xml C:\gpo-export\
 Copy-Item \\dc-nnn.nnn.lo\c$\gpo-export\nnn.html C:\gpo-export\
 copy-item \\dc-nnn.nnn.lo\c$\gpo-export\2026-08-12 c:\gpo-export\ -recurse
-copy-item \\dc-nnn.nnn.lo\c$\ad-export\* c:\ad-export\ -recurse -force
 ########################################################################
+
 
 #По другим доменам — с параметрами:
 .\Export-GpoMap.ps1 -Domain kkk.lo -Server dc-kkk.kkk.lo
@@ -55,4 +58,9 @@ git diff --staged --no-textconv > staged_changes.diff
 
 #Правка политик
 get-gppermission -name 'User - Chrome_unblock_settings' -domain nnn.lo -server dc-nnn.nnn.lo -all | export-csv c:\gpo-export\chrome-unblock-after.csv -notypeinformation
+########################################################################
+
+#Spooler
+Stop-Service Spooler -Force
+Set-Service Spooler -StartupType Disabled
 ########################################################################
