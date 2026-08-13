@@ -377,30 +377,48 @@ else {
 
         # SMB signing: 1 = required
         $smb = $c.SmbSigningRequired
-        Write-Finding "    SMB signing required:   $smb" $(if ($smb -eq '1') { 'ok' } else { 'high' })
+        $smbText = if ($null -ne $smb -and $smb -ne '') { $smb } else { 'not set (not required)' }
+        Write-Finding "    SMB signing required:   $smbText" $(if ($smb -eq '1') { 'ok' } else { 'high' })
         if ($smb -ne '1') {
-            Add-Finding 'DcHardening' 'high' $c.DomainController 'SMB signing is not required'
+            $what = if ($c.Role -and $c.Role -ne 'DomainController') { $c.Role } else { 'domain controller' }
+            Add-Finding 'DcHardening' 'high' $c.DomainController "SMB signing is not required on this $what"
         }
 
-        # LDAPServerIntegrity: 2 = signing required
-        $ldap = $c.LdapServerIntegrity
-        Write-Finding "    LDAP signing required:  $ldap" $(if ($ldap -eq '2') { 'ok' } else { 'high' })
-        if ($ldap -ne '2') {
-            Add-Finding 'DcHardening' 'high' $c.DomainController 'LDAP signing is not enforced'
+        # The LDAP settings live under Services\NTDS, which only exists on a
+        # domain controller. On a CA or a member server their absence is
+        # normal, not a finding.
+        $isDc = ($c.Role -eq 'DomainController' -or -not $c.Role)
+
+        if ($isDc) {
+            # LDAPServerIntegrity: 2 = signing required, 1 = negotiate
+            $ldap = $c.LdapServerIntegrity
+            Write-Finding "    LDAP signing required:  $ldap" $(if ($ldap -eq '2') { 'ok' } else { 'high' })
+            if ($ldap -ne '2') {
+                Add-Finding 'DcHardening' 'high' $c.DomainController 'LDAP signing is not enforced'
+            }
+
+            # LdapEnforceChannelBinding: 2 = always, 1 = when supported
+            $cb = $c.LdapChannelBinding
+            $cbText = if ($cb) { $cb } else { 'not set (disabled)' }
+            Write-Finding "    LDAP channel binding:   $cbText" $(if ($cb -eq '2') { 'ok' } else { 'warn' })
+            if ($cb -ne '2') {
+                Add-Finding 'DcHardening' 'medium' $c.DomainController 'LDAP channel binding is not enforced'
+            }
+        }
+        elseif ($c.LdapServerIntegrity -or $c.LdapChannelBinding) {
+            # unexpected, but report what is there rather than hide it
+            Write-Finding "    LDAP signing:           $($c.LdapServerIntegrity)"
+            Write-Finding "    LDAP channel binding:   $($c.LdapChannelBinding)"
         }
 
-        # LdapEnforceChannelBinding: 2 = always
-        $cb = $c.LdapChannelBinding
-        Write-Finding "    LDAP channel binding:   $cb" $(if ($cb -eq '2') { 'ok' } else { 'warn' })
-        if ($cb -ne '2') {
-            Add-Finding 'DcHardening' 'medium' $c.DomainController 'LDAP channel binding is not enforced'
-        }
-
-        # LmCompatibilityLevel: 5 = NTLMv2 only
+        # LmCompatibilityLevel: 5 = send and accept NTLMv2 only.
+        # Unset means the OS default, which still accepts weaker responses.
         $lm = $c.LmCompatibilityLevel
-        Write-Finding "    LM compatibility level: $lm" $(if ($lm -eq '5') { 'ok' } else { 'warn' })
-        if ($lm -and $lm -ne '5') {
-            Add-Finding 'DcHardening' 'medium' $c.DomainController "LmCompatibilityLevel is $lm, not 5"
+        $lmText = if ($lm) { $lm } else { 'not set (OS default, accepts LM and NTLMv1)' }
+        Write-Finding "    LM compatibility level: $lmText" $(if ($lm -eq '5') { 'ok' } else { 'warn' })
+        if ($lm -ne '5') {
+            $detail = if ($lm) { "LmCompatibilityLevel is $lm, not 5" } else { 'LmCompatibilityLevel is not set, the default accepts weak NTLM' }
+            Add-Finding 'DcHardening' 'medium' $c.DomainController $detail
         }
 
         # The spooler on a DC is a well known relay target
