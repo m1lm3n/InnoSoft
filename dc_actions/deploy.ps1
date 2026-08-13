@@ -15,6 +15,12 @@
         .\deploy.ps1 -domain ttt.lo -mirror
         .\deploy.ps1 -list                # print the target table and exit
         .\deploy.ps1 -exclude deploy.ps1,notes.ps1
+        .\deploy.ps1 -domain xxx.lo -credential (Get-Credential xxx\admin)
+        .\deploy.ps1 -all -promptondenied
+        .\deploy.ps1 -all -credentialmap @{ 'xxx.lo' = $c1; 'ttt.lo' = $c2 }
+
+    A single logon can rarely reach every domain. Supply credentials per
+    domain, or use -promptondenied to be asked only where access fails.
 
     deploy.ps1 excludes itself: it is useless on a domain controller and
     its presence there implies deployment can be run from the server.
@@ -55,7 +61,18 @@ param(
     [switch]$NoPing,
 
     # Commit the working tree first if it is dirty
-    [switch]$RequireClean
+    [switch]$RequireClean,
+
+    # Credentials for domains where the current logon has no rights.
+    # One credential for every target:
+    #     -Credential (Get-Credential xxx\admin)
+    # Or per domain:
+    #     -CredentialMap @{ 'xxx.lo' = Get-Credential xxx\admin }
+    [System.Management.Automation.PSCredential]$Credential,
+    [hashtable]$CredentialMap = @{},
+
+    # Ask for credentials interactively when a target refuses access
+    [switch]$PromptOnDenied
 )
 
 $ErrorActionPreference = 'Stop'
@@ -155,17 +172,62 @@ foreach ($dom in $selected) {
 
     # reachability
     if (-not $NoPing) {
-        if (-not (Test-Connection -ComputerName $server -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
+        $alive = $false
+        try { $alive = Test-Connection -ComputerName $server -Count 1 -Quiet -ErrorAction SilentlyContinue }
+        catch { $alive = $false }
+        if (-not $alive) {
             Write-Host "  unreachable (no ping response)" -ForegroundColor Red
             $results.Add([PSCustomObject]@{ Domain = $dom; Server = $server; Status = 'unreachable'; Detail = '' })
             continue
         }
     }
 
-    # admin share
-    if (-not (Test-Path "\\$server\c$")) {
-        Write-Host "  no access to \\$server\c$ - check rights or run from a domain context" -ForegroundColor Red
-        $results.Add([PSCustomObject]@{ Domain = $dom; Server = $server; Status = 'no access'; Detail = '' })
+    # Open an authenticated session when credentials were supplied. A mapped
+    # PSDrive is enough: SMB caches the session per server, so robocopy that
+    # runs afterwards reuses it.
+    $cred = $null
+    if ($CredentialMap.ContainsKey($dom)) { $cred = $CredentialMap[$dom] }
+    elseif ($Credential) { $cred = $Credential }
+
+    $driveName = $null
+    if ($cred) {
+        try {
+            $driveName = "dep$([guid]::NewGuid().ToString('N').Substring(0,6))"
+            New-PSDrive -Name $driveName -PSProvider FileSystem `
+                -Root "\\$server\c$" -Credential $cred -ErrorAction Stop | Out-Null
+            Write-Host "  authenticated as $($cred.UserName)" -ForegroundColor DarkGray
+        }
+        catch {
+            Write-Host "  could not authenticate as $($cred.UserName): $($_.Exception.Message)" -ForegroundColor Red
+            $results.Add([PSCustomObject]@{ Domain = $dom; Server = $server; Status = 'auth failed'; Detail = $_.Exception.Message })
+            continue
+        }
+    }
+
+    # admin share. Test-Path throws on access denied instead of returning
+    # false, which used to abort the whole -all run at the first refusal.
+    $shareOk = $false
+    try { $shareOk = Test-Path "\\$server\c$" -ErrorAction Stop }
+    catch { $shareOk = $false }
+
+    if (-not $shareOk -and $PromptOnDenied -and -not $cred) {
+        Write-Host "  access denied, asking for credentials" -ForegroundColor DarkYellow
+        try {
+            $cred = Get-Credential -Message "Credentials for $dom ($server)"
+            $driveName = "dep$([guid]::NewGuid().ToString('N').Substring(0,6))"
+            New-PSDrive -Name $driveName -PSProvider FileSystem `
+                -Root "\\$server\c$" -Credential $cred -ErrorAction Stop | Out-Null
+            $shareOk = Test-Path "\\$server\c$" -ErrorAction SilentlyContinue
+        }
+        catch { $shareOk = $false }
+    }
+
+    if (-not $shareOk) {
+        Write-Host "  no access to \\$server\c$" -ForegroundColor Red
+        Write-Host "  pass credentials for this domain:" -ForegroundColor DarkYellow
+        Write-Host "    .\deploy.ps1 -domain $dom -credential (Get-Credential)" -ForegroundColor DarkYellow
+        $results.Add([PSCustomObject]@{ Domain = $dom; Server = $server; Status = 'no access'; Detail = 'admin share unreachable' })
+        if ($driveName) { Remove-PSDrive -Name $driveName -Force -ErrorAction SilentlyContinue }
         continue
     }
 
@@ -194,10 +256,15 @@ foreach ($dom in $selected) {
                 $detail = "robocopy exit $rc"
                 Write-Host "  robocopy failed, exit code $rc" -ForegroundColor Red
                 $output | Where-Object { "$_" -match '\S' } | Select-Object -Last 5 |
-                ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
+                    ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
             }
             else {
-                $copied = @($output | Where-Object { "$_" -match '\.ps1|\.psm1|\.psd1' })
+                $lines = @($output | Where-Object { "$_" -match '\.ps1|\.psm1|\.psd1' })
+                # robocopy lists files that exist only on the target as
+                # "*EXTRA File"; they were not copied and must not be counted
+                $extra = @($lines | Where-Object { "$_" -match 'EXTRA File' })
+                $copied = @($lines | Where-Object { "$_" -notmatch 'EXTRA File' })
+
                 if ($copied.Count) {
                     Write-Host "  copied $($copied.Count) file(s)" -ForegroundColor Green
                     foreach ($c in $copied) {
@@ -207,15 +274,25 @@ foreach ($dom in $selected) {
                 else {
                     Write-Host "  already up to date" -ForegroundColor DarkGray
                 }
-                $detail = "exit $rc"
+
+                if ($extra.Count) {
+                    Write-Host "  $($extra.Count) file(s) present only on the target:" -ForegroundColor DarkYellow
+                    foreach ($e in $extra) {
+                        $name = ("$e".Trim() -split '\\')[-1]
+                        Write-Host "    $name" -ForegroundColor DarkYellow
+                    }
+                    Write-Host "  left untouched. Use -mirror to remove them." -ForegroundColor DarkGray
+                }
+
+                $detail = "copied $($copied.Count), extra $($extra.Count)"
             }
 
             # Files arriving over the network carry the zone marker and will
             # refuse to run under a stricter execution policy.
             try {
                 Get-ChildItem $share -File -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $_.Extension -in '.ps1', '.psm1', '.psd1' } |
-                Unblock-File -ErrorAction SilentlyContinue
+                    Where-Object { $_.Extension -in '.ps1', '.psm1', '.psd1' } |
+                    Unblock-File -ErrorAction SilentlyContinue
                 Write-Host "  unblocked remote scripts" -ForegroundColor DarkGray
             }
             catch { Write-Warning "  could not unblock: $($_.Exception.Message)" }
@@ -229,6 +306,8 @@ foreach ($dom in $selected) {
     else {
         $status = 'skipped (whatif)'
     }
+
+    if ($driveName) { Remove-PSDrive -Name $driveName -Force -ErrorAction SilentlyContinue }
 
     $results.Add([PSCustomObject]@{ Domain = $dom; Server = $server; Status = $status; Detail = $detail })
 }

@@ -72,6 +72,16 @@ Invoke-Command -Session $s -ScriptBlock {
     .\run-adhealth.ps1   -Domain kkk.lo -Server dc-kkk.kkk.lo -Root C:\ad-export\kkk
     .\run-adsecurity.ps1 -Domain kkk.lo -Server dc-kkk.kkk.lo -Root C:\ad-export\kkk
 }
-Copy-Item -FromSession $s -Path C:\gpo-export\kkk -Destination c:\gpo-export\ -Recurse
-Copy-Item -FromSession $s -Path C:\ad-export\kkk -Destination c:\ad-export\ -Recurse
+Copy-Item -FromSession $s -Path C:\gpo-export\kkk -Destination c:\gpo-export\ -Recurse -Force
+Copy-Item -FromSession $s -Path C:\ad-export\kkk -Destination c:\ad-export\ -Recurse -Force
 Remove-PSSession $s
+########################################################################
+
+$Targets = [ordered]@{
+    'nnn.lo'     = @{ Server = 'dc-nnn.nnn.lo'; Note = 'users: reten, conversion, sales' }
+    'kkk.lo'     = @{ Server = 'dc-kkk.kkk.lo'; Note = 'scouts, operators - admin Anton' }
+    'xxx.lo'     = @{ Server = 'dc-xxx.xxx.lo'; Note = 'admin Silver' }
+    'ttt.lo'     = @{ Server = 'dc-ttt.ttt.lo'; Note = 'single DC, fault tolerant' }
+    'a.lo'       = @{ Server = 'dc.a.lo'; Note = 'auth for OnlyOffice and Nextcloud' }
+    'core64.com' = @{ Server = 'dc-dc1.core64.com'; Note = 'management domain' }
+}
