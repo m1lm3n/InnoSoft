@@ -49,7 +49,7 @@ param(
 
     # Files never shipped. This script itself is pointless on a DC, and
     # having it there suggests deployment can be driven from the server.
-    [string[]]$Exclude = @('deploy.ps1'),
+    [string[]]$Exclude = @('deploy.ps1','run-remote.ps1'),
 
     # Source folder, defaults to the folder this script lives in
     [string]$Source,
