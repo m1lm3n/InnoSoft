@@ -5,3 +5,4 @@ Creds.txt
 Architecture.md
 .env
 *.cred.xml
+commands.ps1
