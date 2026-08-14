@@ -77,11 +77,8 @@ Copy-Item -FromSession $s -Path C:\ad-export\kkk -Destination c:\ad-export\ -Rec
 Remove-PSSession $s
 ########################################################################
 
-$Targets = [ordered]@{
-    'nnn.lo'     = @{ Server = 'dc-nnn.nnn.lo'; Note = 'users: reten, conversion, sales' }
-    'kkk.lo'     = @{ Server = 'dc-kkk.kkk.lo'; Note = 'scouts, operators - admin Anton' }
-    'xxx.lo'     = @{ Server = 'dc-xxx.xxx.lo'; Note = 'admin Silver' }
-    'ttt.lo'     = @{ Server = 'dc-ttt.ttt.lo'; Note = 'single DC, fault tolerant' }
-    'a.lo'       = @{ Server = 'dc.a.lo'; Note = 'auth for OnlyOffice and Nextcloud' }
-    'core64.com' = @{ Server = 'dc-dc1.core64.com'; Note = 'management domain' }
+$cred = Get-Credential -UserName "core64\olvin" -Message "Введите пароль администратора домена core64"
+
+Invoke-Command -ComputerName dc-dc1.core64.com -Credential $cred -ScriptBlock {
+    Get-WinEvent -FilterHashtable @{LogName = 'System'; ProviderName = 'Microsoft-Windows-Kerberos-Key-Distribution-Center'; Id = 39, 40, 41 } -MaxEvents 50 -ErrorAction SilentlyContinue | Select-Object TimeCreated, Id, Message | Format-List
 }

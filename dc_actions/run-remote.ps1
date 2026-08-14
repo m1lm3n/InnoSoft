@@ -184,20 +184,66 @@ function Test-IsElevated {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Initialize-WinRmClient {
+    <#
+        The WSMan: provider talks to the local WinRM service, so nothing can
+        be read or written while that service is stopped. This is only the
+        CLIENT side: no listener is created and no firewall rule is opened,
+        unlike what "winrm quickconfig" would do.
+    #>
+    $svc = Get-Service WinRM -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Write-Host "  the WinRM service is not present on this machine" -ForegroundColor Red
+        return $false
+    }
+    if ($svc.Status -eq 'Running') { return $true }
+
+    if (-not (Test-IsElevated)) {
+        Write-Host "  the WinRM service is stopped and starting it needs an elevated console:" -ForegroundColor Yellow
+        Write-Host "    Start-Service WinRM" -ForegroundColor Yellow
+        return $false
+    }
+
+    try {
+        Start-Service WinRM -ErrorAction Stop
+        Write-Host "  started the local WinRM service (client side only)" -ForegroundColor DarkGray
+        Start-Sleep -Milliseconds 500
+        return $true
+    }
+    catch {
+        Write-Host "  could not start WinRM: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
 function Get-TrustedHostList {
+    if (-not (Initialize-WinRmClient)) { return $null }
     try { return (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction Stop).Value }
-    catch { return $null }
+    catch {
+        Write-Verbose "TrustedHosts unreadable: $($_.Exception.Message)"
+        return $null
+    }
 }
 
 function Add-TrustedHostEntry {
     param([string[]]$HostNames)
+
+    if (-not (Initialize-WinRmClient)) {
+        Write-Host "  cannot manage TrustedHosts without the WinRM service. Run as admin:" -ForegroundColor Yellow
+        Write-Host "    Start-Service WinRM" -ForegroundColor Yellow
+        Write-Host "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value '$($HostNames -join ',')' -Concatenate -Force" -ForegroundColor Yellow
+        return $false
+    }
 
     $current = Get-TrustedHostList
     $have = @()
     if ($current) { $have = @($current -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
 
     $missing = @($HostNames | Where-Object { $have -notcontains $_ })
-    if (-not $missing.Count) { return $true }
+    if (-not $missing.Count) {
+        Write-Host "  TrustedHosts already covers: $($HostNames -join ', ')" -ForegroundColor DarkGray
+        return $true
+    }
 
     if (-not (Test-IsElevated)) {
         Write-Host "  TrustedHosts needs an elevated console. Run once as administrator:" -ForegroundColor Yellow
@@ -206,14 +252,30 @@ function Add-TrustedHostEntry {
     }
 
     try {
-        Set-Item WSMan:\localhost\Client\TrustedHosts -Value ($missing -join ',') -Concatenate -Force
-        Write-Host "  TrustedHosts extended with: $($missing -join ', ')" -ForegroundColor DarkGray
-        return $true
+        Set-Item WSMan:\localhost\Client\TrustedHosts -Value ($missing -join ',') -Concatenate -Force -ErrorAction Stop
     }
     catch {
-        Write-Host "  could not update TrustedHosts: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  could not update TrustedHosts: $(($_.Exception.Message -split "`n")[0])" -ForegroundColor Red
         return $false
     }
+
+    # Confirm rather than assume: a silent failure here shows up much later
+    # as an authentication error against a completely unrelated domain.
+    $after = Get-TrustedHostList
+    $now = @()
+    if ($after) { $now = @($after -split ',' | ForEach-Object { $_.Trim() }) }
+    $stillMissing = @($HostNames | Where-Object { $now -notcontains $_ })
+
+    if ($stillMissing.Count) {
+        Write-Host "  TrustedHosts did not take these entries: $($stillMissing -join ', ')" -ForegroundColor Red
+        Write-Host "  Current value: $after" -ForegroundColor DarkGray
+        Write-Host "  A group policy may be enforcing the list. Check:" -ForegroundColor Yellow
+        Write-Host "    Get-Item WSMan:\localhost\Client\TrustedHosts | Select Value, SourceOfValue" -ForegroundColor Yellow
+        return $false
+    }
+
+    Write-Host "  TrustedHosts extended with: $($missing -join ', ')" -ForegroundColor Green
+    return $true
 }
 
 function New-TargetSession {
@@ -230,14 +292,16 @@ function New-TargetSession {
     )
 
     $attempts = @($Method)
-    foreach ($fallback in 'Negotiate', 'Default', 'Kerberos', 'Basic') {
+    foreach ($fallback in 'Negotiate', 'Default', 'Kerberos') {
         if ($attempts -notcontains $fallback) { $attempts += $fallback }
     }
-    # Basic only works over HTTPS or against a TrustedHosts entry; it stays
-    # last so it is tried only when everything else has failed.
+    # Basic is deliberately absent: without HTTPS it sends the password in
+    # clear text, and its failure message about unencrypted traffic used to
+    # mask the real reason reported by the earlier attempts.
     Write-Verbose "auth order: $($attempts -join ', ')"
 
     $lastError = $null
+    $thisError = $null
     foreach ($auth in $attempts) {
         try {
             $sp = @{ ComputerName = $Server; ErrorAction = 'Stop' }
@@ -253,7 +317,9 @@ function New-TargetSession {
             return $session
         }
         catch {
-            $lastError = $_.Exception.Message
+            # the first failure explains the cause; later ones are noise
+            if (-not $lastError) { $lastError = $_.Exception.Message }
+            $thisError = $_.Exception.Message
             # Do not pattern-match the message body: the Kerberos failure text
             # lists "the user name or password specified are invalid" merely as
             # one of its possible causes, which used to abort the fallback loop
@@ -261,8 +327,8 @@ function New-TargetSession {
             #   0x8009030C  logon failure, wrong credentials
             #   0x80090308  account restriction
             #   0x80090353  account locked out
-            if ($lastError -match '0x8009030C|0x80090308|0x80090353') { break }
-            if ($lastError -match 'Access is denied' -and $auth -ne 'Kerberos') { break }
+            if ($thisError -match '0x8009030C|0x80090308|0x80090353') { $lastError = $thisError; break }
+            if ($thisError -match 'Access is denied' -and $auth -ne 'Kerberos') { $lastError = $thisError; break }
         }
     }
 
@@ -297,6 +363,52 @@ function Resolve-DomainCredential {
     $cred = if ($hint) { Get-Credential -Message $msg -UserName $hint } else { Get-Credential -Message $msg }
     if ($cred) { Save-StoredCredential -Dom $Dom -Cred $cred }
     return $cred
+}
+
+function Test-SessionAlive {
+    param($Session)
+    if (-not $Session) { return $false }
+    return ($Session.State -eq 'Opened' -and $Session.Availability -eq 'Available')
+}
+
+function Invoke-WithSession {
+    <#
+        Runs a script block in the session, reopening it when the link drops.
+        The VPN to some controllers loses packets, and a broken session used
+        to abort every remaining toolkit for that domain.
+    #>
+    param(
+        [ref]$SessionRef,
+        [string]$Server,
+        [System.Management.Automation.PSCredential]$Cred,
+        [string]$Method,
+        [scriptblock]$Script,
+        [object[]]$ArgumentList = @(),
+        [int]$Retries = 2
+    )
+
+    for ($try = 1; $try -le ($Retries + 1); $try++) {
+        if (-not (Test-SessionAlive $SessionRef.Value)) {
+            if ($SessionRef.Value) {
+                Write-Host "    session lost, reconnecting..." -ForegroundColor DarkYellow
+                Remove-PSSession $SessionRef.Value -ErrorAction SilentlyContinue
+            }
+            $SessionRef.Value = New-TargetSession -Server $Server -Cred $Cred -Method $Method
+            if (-not $SessionRef.Value) { throw "could not reopen the session to $Server" }
+        }
+        try {
+            return Invoke-Command -Session $SessionRef.Value -ScriptBlock $Script -ArgumentList $ArgumentList -ErrorAction Stop
+        }
+        catch {
+            $msg = $_.Exception.Message
+            $recoverable = $msg -match 'session state|Broken|interrupted|command ID|not equal to Open|cannot be used'
+            if (-not $recoverable -or $try -gt $Retries) { throw }
+            Write-Host "    retry $try after: $(($msg -split "`n")[0])" -ForegroundColor DarkYellow
+            Remove-PSSession $SessionRef.Value -ErrorAction SilentlyContinue
+            $SessionRef.Value = $null
+            Start-Sleep -Seconds (3 * $try)
+        }
+    }
 }
 
 # ---------------------------------------------------------------
@@ -410,7 +522,9 @@ if ($needNtlm.Count) {
     Write-Host "No trust with: $(@($selected | Where-Object { $Targets[$_].Trusted -eq $false }) -join ', ')" -ForegroundColor DarkYellow
     Write-Host "These need NTLM, which WinRM allows only for TrustedHosts entries." -ForegroundColor DarkYellow
     if ($EnsureTrustedHosts) {
-        [void](Add-TrustedHostEntry -HostNames $needNtlm)
+        if (-not (Add-TrustedHostEntry -HostNames $needNtlm)) {
+            Write-Host "TrustedHosts could not be prepared - the untrusted domains will fail." -ForegroundColor Red
+        }
     }
     else {
         $have = @()
@@ -504,7 +618,8 @@ foreach ($dom in $selected) {
             Write-Host "  running $kit..." -ForegroundColor Yellow
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
-            $out = Invoke-Command -Session $session -ArgumentList $RemoteScripts, $kit, $dom, $server, $remoteRoot -ScriptBlock {
+            $out = Invoke-WithSession -SessionRef ([ref]$session) -Server $server -Cred $cred -Method $Authentication `
+                -ArgumentList @($RemoteScripts, $kit, $dom, $server, $remoteRoot) -Script {
                 param($scripts, $kit, $dom, $srv, $root)
                 Set-Location $scripts
                 $wrapper = ".\run-$kit.ps1"
@@ -526,29 +641,53 @@ foreach ($dom in $selected) {
         $localDir = Join-Path (Join-Path $LocalRoot $dom) $today
         New-Item -ItemType Directory -Path $localDir -Force | Out-Null
 
-        $remoteFiles = Invoke-Command -Session $session -ArgumentList $remoteRoot -ScriptBlock {
+        $remoteFiles = Invoke-WithSession -SessionRef ([ref]$session) -Server $server -Cred $cred -Method $Authentication `
+            -ArgumentList @($remoteRoot) -Script {
             param($root)
             Get-ChildItem $root -Recurse -Filter *.csv -File -ErrorAction SilentlyContinue |
             Select-Object -Expand FullName
         }
 
         $copied = 0
+        $failedFiles = @()
         foreach ($f in $remoteFiles) {
-            try {
-                Copy-Item -FromSession $session -Path $f -Destination $localDir -Force
-                $copied++
+            $ok = $false
+            for ($attempt = 1; $attempt -le 3 -and -not $ok; $attempt++) {
+                try {
+                    if (-not (Test-SessionAlive $session)) {
+                        Remove-PSSession $session -ErrorAction SilentlyContinue
+                        $session = New-TargetSession -Server $server -Cred $cred -Method $Authentication
+                        if (-not $session) { break }
+                    }
+                    Copy-Item -FromSession $session -Path $f -Destination $localDir -Force -ErrorAction Stop
+                    $ok = $true
+                    $copied++
+                }
+                catch {
+                    if ($attempt -eq 3) {
+                        $failedFiles += (Split-Path $f -Leaf)
+                        Write-Warning "    could not copy $(Split-Path $f -Leaf): $(($_.Exception.Message -split "`n")[0])"
+                    }
+                    else { Start-Sleep -Seconds 2 }
+                }
             }
-            catch { Write-Warning "    could not copy $f : $($_.Exception.Message)" }
+        }
+        if ($failedFiles.Count) {
+            Write-Host "  $($failedFiles.Count) file(s) not collected: $($failedFiles -join ', ')" -ForegroundColor Yellow
         }
 
         Write-Host "  collected $copied file(s) into $localDir" -ForegroundColor Green
         $detail = "$copied files"
 
         if (-not $KeepRemote) {
-            Invoke-Command -Session $session -ArgumentList $remoteRoot -ScriptBlock {
-                param($root)
-                Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+            try {
+                Invoke-WithSession -SessionRef ([ref]$session) -Server $server -Cred $cred -Method $Authentication `
+                    -ArgumentList @($remoteRoot) -Script {
+                    param($root)
+                    Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+                }
             }
+            catch { Write-Warning "  could not clean up $remoteRoot on the controller" }
             Write-Host "  working folder removed from the controller" -ForegroundColor DarkGray
         }
 
