@@ -92,7 +92,7 @@ param(
     #     xxx.lo = xxx\adm.olvin
     #     ttt.lo = ttt\adm.olvin
     # Used to prefill the prompt so the account never has to be retyped.
-    [string]$EnvFile = (Join-Path $PSScriptRoot '..\\.env'),
+    [string]$EnvFile = (Join-Path $PSScriptRoot '.env'),
 
     # Prompt for a credential, store it encrypted, then exit
     [switch]$SetCredential,
@@ -677,13 +677,22 @@ foreach ($dom in $selected) {
                 # and never returns as data. Redirecting stream 6 into the
                 # pipeline turns it into a value we can filter here instead
                 # of watching it scroll past.
+                # 6>&1 folds the information stream (Write-Host) into the
+                # pipeline, 3>&1 the warnings. Without both, WinRM forwards
+                # them straight to the caller console and no filtering here
+                # can ever apply.
                 if ($skipAnalyze) {
-                    $log = & $wrapper -Domain $dom -Server $srv -Root $root -SkipAnalyze 6>&1
+                    $log = & $wrapper -Domain $dom -Server $srv -Root $root -SkipAnalyze 6>&1 3>&1
                 }
                 else {
-                    $log = & $wrapper -Domain $dom -Server $srv -Root $root 6>&1
+                    $log = & $wrapper -Domain $dom -Server $srv -Root $root 6>&1 3>&1
                 }
-                $log | ForEach-Object { "$_" }
+
+                $log | ForEach-Object {
+                    if ($_ -is [System.Management.Automation.WarningRecord]) { "WARNING: $($_.Message)" }
+                    elseif ($_ -is [System.Management.Automation.ErrorRecord]) { "ERROR: $($_.Exception.Message)" }
+                    else { "$_" }
+                }
             }
 
             $sw.Stop()
@@ -795,7 +804,16 @@ foreach ($dom in $selected) {
                     # ---------------------------------------------------
                     # Analyse here, where the history of previous runs is.
                     # ---------------------------------------------------
-                    if (-not $AnalyzeOnServer) {
+                    if ($AnalyzeOnServer) {
+                        # nothing was captured, but the collection log is
+                        # still worth putting in the report
+                        $reportData.Add([PSCustomObject]@{
+                                Domain   = $dom
+                                DataPath = $localDir
+                                Sections = @()
+                            })
+                    }
+                    else {
                         $prevDir = Get-ChildItem (Join-Path $LocalRoot $dom) -Directory -ErrorAction SilentlyContinue |
                         Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' -and $_.Name -ne $today } |
                         Sort-Object Name -Descending | Select-Object -First 1
@@ -826,7 +844,13 @@ foreach ($dom in $selected) {
 
                             if ($script:CanReport) {
                                 $cap = Invoke-CapturedScript -Path $anPath -Arguments $anArgs
-                                $sections.Add([PSCustomObject]@{ Name = $kit.Name; Lines = $cap.Lines })
+                                $sections.Add([PSCustomObject]@{
+                                        Name     = $kit.Name
+                                        Lines    = $cap.Lines
+                                        Warnings = $cap.Warnings
+                                        Error    = $cap.Error
+                                    })
+
                                 if ($cap.Error) {
                                     Write-Host " failed: $(($cap.Error -split "`n")[0])" -ForegroundColor Red
                                 }
@@ -834,7 +858,8 @@ foreach ($dom in $selected) {
                                     Write-Host " no output captured" -ForegroundColor Yellow
                                 }
                                 else {
-                                    Write-Host " ok ($($cap.Count) lines)" -ForegroundColor Green
+                                    $w = if ($cap.Warnings.Count) { ", $($cap.Warnings.Count) warning(s)" } else { '' }
+                                    Write-Host " ok ($($cap.Count) lines$w)" -ForegroundColor Green
                                 }
                             }
                             else {
@@ -870,7 +895,14 @@ foreach ($dom in $selected) {
                                 elseif ("$cl" -match '^\s*\[\d+/\d+\]') { $colour = 'Cyan' }
                                 , @([PSCustomObject]@{ Text = "$cl"; Color = $colour })
                             }
-                            $sections.Add([PSCustomObject]@{ Name = 'Collection log'; Lines = @($collLines) })
+                            $collWarn = @($collectionLog | Where-Object { "$_" -match '^WARNING: ' } |
+                                ForEach-Object { "$_" -replace '^WARNING: ', '' })
+                            $sections.Add([PSCustomObject]@{
+                                    Name     = 'Collection log'
+                                    Lines    = @($collLines)
+                                    Warnings = $collWarn
+                                    Error    = $null
+                                })
                         }
 
                         $reportData.Add([PSCustomObject]@{
@@ -959,15 +991,10 @@ else {
     Write-Host "All $($results.Count) target(s) collected" -ForegroundColor Green
 }
 
-# ---------------------------------------------------------------
-# Safety net: if a capture was interrupted the proxy would silence the
-# console for the rest of the session.
-# ---------------------------------------------------------------
-if ($script:CanReport -and (Get-Command Reset-ConsoleCapture -ErrorAction SilentlyContinue)) {
-    if (Test-Path function:global:Write-Host) {
-        Reset-ConsoleCapture
-        Write-Warning 'The output capture was still active and has been released.'
-    }
+# Older versions of AuditCapture replaced Write-Host with a global proxy.
+# If one is still installed from a previous session, drop it.
+if (Test-Path function:global:Write-Host) {
+    Remove-Item function:global:Write-Host -Force -ErrorAction SilentlyContinue
 }
 
 # ---------------------------------------------------------------
@@ -983,7 +1010,11 @@ if (-not $NoReport -and $script:CanReport -and $reportData.Count) {
 
         Write-Host ""
         Write-Host "Report: $($rep.Path)" -ForegroundColor Green
-        Write-Host ("  $($rep.Domains) domain(s), $($rep.High) high, $($rep.Medium) medium, $($rep.Low) low, $($rep.SizeKb) KB") -ForegroundColor DarkGray
+        $warnBit = ''
+        if ($rep.PSObject.Properties.Name -contains 'Warnings' -and $rep.Warnings) {
+            $warnBit = ", $($rep.Warnings) warning(s)"
+        }
+        Write-Host ("  $($rep.Domains) domain(s), $($rep.High) high, $($rep.Medium) medium, $($rep.Low) low$warnBit, $($rep.SizeKb) KB") -ForegroundColor DarkGray
         if (-not $OpenReport) { Write-Host "  open with: ii '$($rep.Path)'" -ForegroundColor DarkGray }
     }
     catch { Write-Warning "Could not build the report: $($_.Exception.Message)" }

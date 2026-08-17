@@ -1,161 +1,90 @@
 <#
     AuditCapture.psm1
 
-    Captures console output produced by Write-Host, keeping the colour of
-    every fragment, so it can be rendered later instead of scrolling past.
+    Captures the console output of a script, keeping the colour of every
+    fragment, so it can be rendered into a report instead of scrolling past.
 
     How it works
-        Write-Host writes straight to the host and never touches the
-        pipeline, so it cannot be redirected. A function of the same name
-        defined in the global scope shadows the cmdlet everywhere, including
-        inside scripts called afterwards. The proxy records what it is given
-        and, unless asked to echo, prints nothing.
+        In Windows PowerShell 5 Write-Host writes to the information stream.
+        Redirecting that stream into the pipeline with 6>&1 yields
+        InformationRecord objects whose MessageData is a
+        HostInformationMessage carrying Message, ForegroundColor,
+        BackgroundColor and NoNewLine.
 
-    The analyzers need no changes at all.
+        Nothing is overridden and no global state is touched, so a failure
+        here can never silence the console for the rest of the session.
+        An earlier version replaced Write-Host with a proxy function and did
+        exactly that whenever anything went wrong.
 
     Usage
         Import-Module .\AuditCapture.psm1
-        Start-ConsoleCapture
-        & .\Analyze-AdHealth.ps1 -Path C:\audit\nnn.lo\2026-08-14
-        $lines = Stop-ConsoleCapture
-
-    Returned shape: an array of lines, each line an array of segments:
-        @{ Text = 'MS16-072 RISK: 1'; Color = 'Red' }
+        $r = Invoke-CapturedScript -Path .\Analyze-AdHealth.ps1 `
+                -Arguments @{ Path = 'C:\audit\nnn.lo\2026-08-17'; Domain = 'nnn.lo' }
+        $r.Lines    # array of lines, each an array of @{ Text; Color }
+        $r.Warnings # warning stream, separately
+        $r.Error    # message if the script threw
 #>
 
-# State lives in the global scope on purpose. The proxy is registered as a
-# global function, and a script block registered that way loses its link to
-# the module scope, so anything it referenced there would be unreachable.
-# Keeping everything global is less elegant and actually works.
-$global:AuditCaptureLines = $null
-$global:AuditCaptureCurrent = $null
-$global:AuditCaptureEcho = $false
-$global:AuditCaptureActive = $false
-
-function Start-ConsoleCapture {
+function ConvertFrom-InformationRecords {
     <#
-        .SYNOPSIS
-        Redirects Write-Host into a buffer until Stop-ConsoleCapture.
-
-        .PARAMETER Echo
-        Also print to the console, for debugging the capture itself.
+        Turns a stream of records into lines of coloured segments,
+        honouring NoNewLine so multi-colour lines stay on one line.
     #>
-    [CmdletBinding()]
-    param([switch]$Echo)
+    param($Records)
 
-    if ($global:AuditCaptureActive) { [void](Stop-ConsoleCapture) }
+    $lines = New-Object System.Collections.Generic.List[object]
+    $current = New-Object System.Collections.Generic.List[object]
 
-    $global:AuditCaptureLines = New-Object System.Collections.Generic.List[object]
-    $global:AuditCaptureCurrent = New-Object System.Collections.Generic.List[object]
-    $global:AuditCaptureEcho = [bool]$Echo
-    $global:AuditCaptureActive = $true
+    foreach ($rec in @($Records)) {
+        if ($null -eq $rec) { continue }
 
-    $proxy = {
-        [CmdletBinding()]
-        param(
-            [Parameter(Position = 0, ValueFromPipeline = $true, ValueFromRemainingArguments = $true)]
-            [object[]]$Object,
+        $text = $null
+        $colour = 'Gray'
+        $noNewline = $false
 
-            [System.ConsoleColor]$ForegroundColor,
-            [System.ConsoleColor]$BackgroundColor,
-            [switch]$NoNewline,
-            [object]$Separator = ' '
-        )
+        $data = $null
+        if ($rec -is [System.Management.Automation.InformationRecord]) { $data = $rec.MessageData }
+        else { $data = $rec }
 
-        process {
-            # A failure here would silence the console for the rest of the
-            # session, so nothing in this block is allowed to throw.
-            try {
-                $text = ''
-                if ($null -ne $Object) {
-                    $text = ($Object | ForEach-Object { "$_" }) -join "$Separator"
-                }
+        if ($null -eq $data) { continue }
 
-                $colour = 'Gray'
-                if ($PSBoundParameters.ContainsKey('ForegroundColor')) { $colour = "$ForegroundColor" }
+        # Write-Host produces this type; Write-Information produces a string
+        if ($data.GetType().Name -eq 'HostInformationMessage') {
+            $text = "$($data.Message)"
+            if ($null -ne $data.ForegroundColor) { $colour = "$($data.ForegroundColor)" }
+            if ($null -ne $data.NoNewLine) { $noNewline = [bool]$data.NoNewLine }
+        }
+        else {
+            $text = "$data"
+        }
 
-                # one Write-Host may carry several lines
-                $parts = "$text" -split "`r?`n"
-                for ($i = 0; $i -lt $parts.Count; $i++) {
-                    $global:AuditCaptureCurrent.Add([PSCustomObject]@{ Text = $parts[$i]; Color = $colour })
-                    $isLast = ($i -eq $parts.Count - 1)
-                    if (-not $isLast -or -not $NoNewline) {
-                        $global:AuditCaptureLines.Add(@($global:AuditCaptureCurrent.ToArray()))
-                        $global:AuditCaptureCurrent = New-Object System.Collections.Generic.List[object]
-                    }
-                }
-            }
-            catch {
-                # fall through to the real cmdlet rather than lose the line
-                $global:AuditCaptureEcho = $true
-            }
-
-            if ($global:AuditCaptureEcho) {
-                $fwd = @{}
-                foreach ($k in $PSBoundParameters.Keys) { $fwd[$k] = $PSBoundParameters[$k] }
-                Microsoft.PowerShell.Utility\Write-Host @fwd
+        # a single call may still carry embedded newlines
+        $parts = "$text" -split "`r?`n"
+        for ($i = 0; $i -lt $parts.Count; $i++) {
+            $current.Add([PSCustomObject]@{ Text = $parts[$i]; Color = $colour })
+            $isLast = ($i -eq $parts.Count - 1)
+            if (-not $isLast -or -not $noNewline) {
+                $lines.Add(@($current.ToArray()))
+                $current = New-Object System.Collections.Generic.List[object]
             }
         }
     }
 
-    Set-Item -Path function:global:Write-Host -Value $proxy -Force
-}
-
-function Stop-ConsoleCapture {
-    <#
-        .SYNOPSIS
-        Restores the real Write-Host and returns everything captured.
-        Safe to call even if capture was never started.
-    #>
-    [CmdletBinding()]
-    param()
-
-    try {
-        if ($global:AuditCaptureCurrent -and $global:AuditCaptureCurrent.Count) {
-            $global:AuditCaptureLines.Add(@($global:AuditCaptureCurrent.ToArray()))
-        }
-    }
-    catch { }
-
-    $global:AuditCaptureCurrent = New-Object System.Collections.Generic.List[object]
-    Remove-Item -Path function:global:Write-Host -Force -ErrorAction SilentlyContinue
-    $global:AuditCaptureActive = $false
-
-    $out = @()
-    if ($global:AuditCaptureLines) { $out = @($global:AuditCaptureLines.ToArray()) }
-    $global:AuditCaptureLines = New-Object System.Collections.Generic.List[object]
-    return , $out
-}
-
-function Reset-ConsoleCapture {
-    <#
-        .SYNOPSIS
-        Emergency release: removes the proxy whatever state it is in.
-        Call this if console output ever goes quiet.
-    #>
-    [CmdletBinding()]
-    param()
-    Remove-Item -Path function:global:Write-Host -Force -ErrorAction SilentlyContinue
-    $global:AuditCaptureActive = $false
-    $global:AuditCaptureLines = New-Object System.Collections.Generic.List[object]
-    $global:AuditCaptureCurrent = New-Object System.Collections.Generic.List[object]
-}
-
-function Test-ConsoleCapture {
-    [CmdletBinding()]
-    param()
-    return [bool]$global:AuditCaptureActive
+    if ($current.Count) { $lines.Add(@($current.ToArray())) }
+    return , @($lines.ToArray())
 }
 
 function Invoke-CapturedScript {
     <#
         .SYNOPSIS
-        Runs a script with its console output captured, returning both the
-        captured lines and whatever it threw.
+        Runs a script with its console output captured rather than printed.
+
+        .PARAMETER Echo
+        Also print the captured output, for debugging.
 
         .EXAMPLE
         Invoke-CapturedScript -Path .\Analyze-AdHealth.ps1 `
-            -Arguments @{ Path = 'C:\audit\nnn.lo\2026-08-14'; Domain = 'nnn.lo' }
+            -Arguments @{ Path = 'C:\audit\nnn.lo\2026-08-17'; Domain = 'nnn.lo' }
     #>
     [CmdletBinding()]
     param(
@@ -166,23 +95,70 @@ function Invoke-CapturedScript {
 
     if (-not (Test-Path $Path)) { throw "Script not found: $Path" }
 
-    Start-ConsoleCapture -Echo:$Echo
     $err = $null
-    $lines = @()
-    try { & $Path @Arguments | Out-Null }
-    catch { $err = $_.Exception.Message }
-    finally {
-        $lines = Stop-ConsoleCapture
-        # belt and braces: the proxy must never outlive this call
-        if (Test-Path function:global:Write-Host) { Reset-ConsoleCapture }
+    $records = @()
+    $warnings = @()
+
+    try {
+        # 6>&1 folds the information stream into the pipeline, 3>&1 the
+        # warnings; both then arrive as objects instead of hitting the host
+        $records = & $Path @Arguments 6>&1 3>&1
+    }
+    catch {
+        $err = $_.Exception.Message
+    }
+
+    $info = @()
+    foreach ($r in @($records)) {
+        if ($r -is [System.Management.Automation.WarningRecord]) {
+            $warnings += "$($r.Message)"
+            $info += [System.Management.Automation.HostInformationMessage]@{
+                Message         = "WARNING: $($r.Message)"
+                ForegroundColor = [System.ConsoleColor]::Yellow
+            }
+        }
+        elseif ($r -is [System.Management.Automation.InformationRecord]) { $info += $r }
+        elseif ($r -is [System.Management.Automation.ErrorRecord]) {
+            $info += [System.Management.Automation.HostInformationMessage]@{
+                Message         = "ERROR: $($r.Exception.Message)"
+                ForegroundColor = [System.ConsoleColor]::Red
+            }
+        }
+        # anything else is ordinary pipeline output and is dropped: the
+        # analyzers return nothing useful, they only print
+    }
+
+    $lines = ConvertFrom-InformationRecords -Records $info
+
+    if ($Echo) {
+        foreach ($line in $lines) {
+            foreach ($seg in @($line)) {
+                Microsoft.PowerShell.Utility\Write-Host $seg.Text -ForegroundColor $seg.Color -NoNewline
+            }
+            Microsoft.PowerShell.Utility\Write-Host ''
+        }
     }
 
     return [PSCustomObject]@{
-        Lines = $lines
-        Error = $err
-        Count = @($lines).Count
+        Lines    = $lines
+        Warnings = @($warnings)
+        Error    = $err
+        Count    = @($lines).Count
     }
 }
 
-Export-ModuleMember -Function Start-ConsoleCapture, Stop-ConsoleCapture,
-    Test-ConsoleCapture, Reset-ConsoleCapture, Invoke-CapturedScript
+function Reset-ConsoleCapture {
+    <#
+        .SYNOPSIS
+        Removes a Write-Host proxy left behind by an older version of this
+        module. Harmless to call at any time.
+    #>
+    [CmdletBinding()]
+    param()
+    if (Test-Path function:global:Write-Host) {
+        Remove-Item -Path function:global:Write-Host -Force -ErrorAction SilentlyContinue
+        Write-Verbose 'Removed a leftover Write-Host proxy.'
+    }
+}
+
+Export-ModuleMember -Function Invoke-CapturedScript, ConvertFrom-InformationRecords, Reset-ConsoleCapture

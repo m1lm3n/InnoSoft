@@ -75,12 +75,12 @@ function Get-FindingsForDomain {
         try {
             foreach ($r in (Import-Csv $full)) {
                 $rows.Add([PSCustomObject]@{
-                        Source   = $map[$file]
-                        Area     = $r.Area
-                        Severity = "$($r.Severity)".ToLower()
-                        Item     = $r.Item
-                        Detail   = $r.Detail
-                    })
+                    Source   = $map[$file]
+                    Area     = $r.Area
+                    Severity = "$($r.Severity)".ToLower()
+                    Item     = $r.Item
+                    Detail   = $r.Detail
+                })
             }
         }
         catch { }
@@ -110,7 +110,7 @@ function ConvertTo-LogHtml {
     param($Lines)
 
     if (-not $Lines -or @($Lines).Count -eq 0) {
-        return '<div class="empty">no output</div>'
+        return '<div class="empty">nothing was captured - the analyzer either produced no output or did not run</div>'
     }
 
     $sb = New-Object System.Text.StringBuilder
@@ -191,6 +191,15 @@ function New-AuditHtmlReport {
         $cards += '<div class="card sev-medium"><div class="num">' + $d.Counts.medium + '</div><div class="lbl">medium</div></div>'
         $cards += '<div class="card sev-low"><div class="num">' + $d.Counts.low + '</div><div class="lbl">low</div></div>'
 
+        $warnTotal = 0
+        foreach ($sec in @($d.Sections)) {
+            if ($sec.PSObject.Properties.Name -contains 'Warnings') { $warnTotal += @($sec.Warnings).Count }
+        }
+        if ($warnTotal) {
+            $cards += '<div class="card sev-medium"><div class="num">' + $warnTotal +
+                '</div><div class="lbl">warnings</div></div>'
+        }
+
         foreach ($k in @('DcCount', 'GpoCount', 'ComputerCount', 'PrivEntries')) {
             if ($d.Meta.Contains($k)) {
                 $label = switch ($k) {
@@ -200,7 +209,7 @@ function New-AuditHtmlReport {
                     'PrivEntries' { 'priv. entries' }
                 }
                 $cards += '<div class="card plain"><div class="num">' + (ConvertTo-HtmlText $d.Meta[$k]) +
-                '</div><div class="lbl">' + $label + '</div></div>'
+                    '</div><div class="lbl">' + $label + '</div></div>'
             }
         }
         $cards += '</div>'
@@ -255,9 +264,40 @@ function New-AuditHtmlReport {
         # --- logs ---
         $logs = '<h3 class="logs-title">Analyzer output</h3>'
         foreach ($sec in @($d.Sections)) {
-            $logs += '<details class="logbox"><summary>' + (ConvertTo-HtmlText $sec.Name) + '</summary>'
+            $warnCount = 0
+            if ($sec.PSObject.Properties.Name -contains 'Warnings') { $warnCount = @($sec.Warnings).Count }
+
+            $tag = ''
+            if ($sec.PSObject.Properties.Name -contains 'Error' -and $sec.Error) {
+                $tag = '<span class="sec-tag err">failed</span>'
+            }
+            elseif ($warnCount) {
+                $tag = '<span class="sec-tag warn">' + $warnCount + ' warning' +
+                    $(if ($warnCount -gt 1) { 's' } else { '' }) + '</span>'
+            }
+
+            $lineCount = @($sec.Lines).Count
+            $tag += '<span class="sec-count">' + $lineCount + ' lines</span>'
+
+            $logs += '<details class="logbox"><summary>' + (ConvertTo-HtmlText $sec.Name) + $tag + '</summary>'
+
+            if ($sec.PSObject.Properties.Name -contains 'Error' -and $sec.Error) {
+                $logs += '<div class="secmsg err">' + (ConvertTo-HtmlText $sec.Error) + '</div>'
+            }
+            if ($warnCount) {
+                $logs += '<div class="secmsg warn"><b>' + $warnCount + ' warning(s)</b><ul>'
+                foreach ($w in (@($sec.Warnings) | Select-Object -First 12)) {
+                    $logs += '<li>' + (ConvertTo-HtmlText $w) + '</li>'
+                }
+                if ($warnCount -gt 12) { $logs += '<li>... and ' + ($warnCount - 12) + ' more</li>' }
+                $logs += '</ul></div>'
+            }
+
             $logs += (ConvertTo-LogHtml $sec.Lines)
             $logs += '</details>'
+        }
+        if (-not @($d.Sections).Count) {
+            $logs += '<div class="empty">no analyzer output was captured for this domain</div>'
         }
 
         [void]$panels.Append('<section class="panel' + $active + '" id="' + $id + '">' +
@@ -341,6 +381,16 @@ td.detail{color:var(--ink-soft);font-size:13px}
 pre.term{margin:0;background:var(--term-bg);color:#c8ccd4;padding:16px 18px;overflow-x:auto;
   font-family:var(--font-mono);font-size:12.5px;line-height:1.45;tab-size:4}
 .empty{color:var(--ink-soft);font-style:italic;padding:14px 0}
+.sec-tag{font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px;margin-left:6px}
+.sec-tag.warn{background:#fdf3e2;color:var(--medium)}
+.sec-tag.err{background:#fdecec;color:var(--high)}
+.sec-count{margin-left:auto;font-size:11.5px;font-weight:400;color:var(--ink-soft);
+  font-family:var(--font-mono)}
+.secmsg{padding:10px 16px;font-size:13px;border-top:1px solid var(--line)}
+.secmsg.warn{background:#fffaf0;color:#8a5f10}
+.secmsg.err{background:#fff5f5;color:#8f2d2d}
+.secmsg ul{margin:6px 0 0;padding-left:20px}
+.secmsg li{margin:2px 0;font-family:var(--font-mono);font-size:12px}
 @media print{
   .tabs,.toolbar{display:none}
   .panel{display:block!important;page-break-after:always}
@@ -399,23 +449,33 @@ pre.term{margin:0;background:var(--term-bg);color:#c8ccd4;padding:16px 18px;over
 '@
 
     $head = '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
-    '<meta name="viewport" content="width=device-width, initial-scale=1">' +
-    '<title>' + (ConvertTo-HtmlText $Title) + '</title><style>' + $css + '</style></head><body>'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+        '<title>' + (ConvertTo-HtmlText $Title) + '</title><style>' + $css + '</style></head><body>'
+
+    $grandWarn = 0
+    foreach ($d in $prepared) {
+        foreach ($sec in @($d.Sections)) {
+            if ($sec.PSObject.Properties.Name -contains 'Warnings') { $grandWarn += @($sec.Warnings).Count }
+        }
+    }
 
     $totals = '<div class="totals">' +
-    '<div class="total high"><b>' + $grand.high + '</b> high</div>' +
-    '<div class="total medium"><b>' + $grand.medium + '</b> medium</div>' +
-    '<div class="total"><b>' + $grand.low + '</b> low</div>' +
-    '<div class="total"><b>' + $prepared.Count + '</b> domains</div>' +
-    '</div>'
+        '<div class="total high"><b>' + $grand.high + '</b> high</div>' +
+        '<div class="total medium"><b>' + $grand.medium + '</b> medium</div>' +
+        '<div class="total"><b>' + $grand.low + '</b> low</div>' +
+        '<div class="total"><b>' + $prepared.Count + '</b> domains</div>'
+    if ($grandWarn) {
+        $totals += '<div class="total medium"><b>' + $grandWarn + '</b> warnings</div>'
+    }
+    $totals += '</div>'
 
     $header = '<header><h1>' + (ConvertTo-HtmlText $Title) + '</h1>' +
-    '<div class="sub">generated ' + $generated.ToString('yyyy-MM-dd HH:mm') +
-    ' on ' + (ConvertTo-HtmlText $env:COMPUTERNAME) + '</div>' +
-    $totals + '<nav class="tabs">' + $tabs.ToString() + '</nav></header>'
+        '<div class="sub">generated ' + $generated.ToString('yyyy-MM-dd HH:mm') +
+        ' on ' + (ConvertTo-HtmlText $env:COMPUTERNAME) + '</div>' +
+        $totals + '<nav class="tabs">' + $tabs.ToString() + '</nav></header>'
 
     $html = $head + $header + '<main>' + $panels.ToString() + '</main>' +
-    '<script>' + $js + '</script></body></html>'
+        '<script>' + $js + '</script></body></html>'
 
     $dir = Split-Path $Path -Parent
     if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -426,12 +486,13 @@ pre.term{margin:0;background:var(--term-bg);color:#c8ccd4;padding:16px 18px;over
     if ($Open) { Start-Process $Path }
 
     return [PSCustomObject]@{
-        Path    = $Path
-        Domains = $prepared.Count
-        High    = $grand.high
-        Medium  = $grand.medium
-        Low     = $grand.low
-        SizeKb  = [math]::Round((Get-Item $Path).Length / 1KB, 1)
+        Path     = $Path
+        Domains  = $prepared.Count
+        High     = $grand.high
+        Medium   = $grand.medium
+        Low      = $grand.low
+        Warnings = $grandWarn
+        SizeKb   = [math]::Round((Get-Item $Path).Length / 1KB, 1)
     }
 }
 
