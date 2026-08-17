@@ -637,58 +637,130 @@ foreach ($dom in $selected) {
             Write-Host ("    done in {0:N0}s" -f $sw.Elapsed.TotalSeconds) -ForegroundColor DarkGray
         }
 
-        # bring the CSVs home
+        # ---------------------------------------------------------------
+        # Bring the results home as ONE archive.
+        #
+        # Copying thirty files one by one meant thirty round trips over a
+        # link that already loses packets, which took minutes per domain.
+        # The controller packs everything into a single zip, that zip comes
+        # back in one transfer, and it is unpacked locally.
+        # ---------------------------------------------------------------
         $localDir = Join-Path (Join-Path $LocalRoot $dom) $today
         New-Item -ItemType Directory -Path $localDir -Force | Out-Null
 
-        $remoteFiles = Invoke-WithSession -SessionRef ([ref]$session) -Server $server -Cred $cred -Method $Authentication `
-            -ArgumentList @($remoteRoot) -Script {
-            param($root)
-            Get-ChildItem $root -Recurse -Filter *.csv -File -ErrorAction SilentlyContinue |
-            Select-Object -Expand FullName
+        $archiveName = "$dom-$today-audit.zip"
+
+        $pack = Invoke-WithSession -SessionRef ([ref]$session) -Server $server -Cred $cred -Method $Authentication `
+            -ArgumentList @($remoteRoot, $archiveName) -Script {
+            param($root, $name)
+
+            $files = Get-ChildItem $root -Recurse -Filter *.csv -File -ErrorAction SilentlyContinue
+            if (-not $files) { return [PSCustomObject]@{ Count = 0; Path = $null; Size = 0 } }
+
+            # keep the archive outside the folder being compressed
+            $zip = Join-Path $env:TEMP $name
+            if (Test-Path $zip) { Remove-Item $zip -Force }
+            Compress-Archive -Path $files.FullName -DestinationPath $zip -Force
+
+            [PSCustomObject]@{
+                Count = $files.Count
+                Path  = $zip
+                Size  = (Get-Item $zip).Length
+            }
         }
 
         $copied = 0
-        $failedFiles = @()
-        foreach ($f in $remoteFiles) {
-            $ok = $false
-            for ($attempt = 1; $attempt -le 3 -and -not $ok; $attempt++) {
+        if (-not $pack -or $pack.Count -eq 0) {
+            Write-Host "  nothing to collect" -ForegroundColor Yellow
+            $detail = 'no files'
+        }
+        else {
+            $kb = [math]::Round($pack.Size / 1KB, 1)
+            Write-Host "  packed $($pack.Count) file(s) into $kb KB, transferring..." -ForegroundColor DarkGray
+
+            $localZip = Join-Path $localDir $archiveName
+            $got = $false
+
+            # For a small archive the fastest route is straight through the
+            # session as base64: one call, no separate file transfer channel.
+            if ($pack.Size -lt 20MB) {
                 try {
-                    if (-not (Test-SessionAlive $session)) {
-                        Remove-PSSession $session -ErrorAction SilentlyContinue
-                        $session = New-TargetSession -Server $server -Cred $cred -Method $Authentication
-                        if (-not $session) { break }
+                    $b64 = Invoke-WithSession -SessionRef ([ref]$session) -Server $server -Cred $cred -Method $Authentication `
+                        -ArgumentList @($pack.Path) -Script {
+                        param($zip)
+                        [Convert]::ToBase64String([IO.File]::ReadAllBytes($zip))
                     }
-                    Copy-Item -FromSession $session -Path $f -Destination $localDir -Force -ErrorAction Stop
-                    $ok = $true
-                    $copied++
+                    [IO.File]::WriteAllBytes($localZip, [Convert]::FromBase64String($b64))
+                    $got = $true
                 }
                 catch {
-                    if ($attempt -eq 3) {
-                        $failedFiles += (Split-Path $f -Leaf)
-                        Write-Warning "    could not copy $(Split-Path $f -Leaf): $(($_.Exception.Message -split "`n")[0])"
-                    }
-                    else { Start-Sleep -Seconds 2 }
+                    Write-Host "    inline transfer failed, falling back to Copy-Item" -ForegroundColor DarkYellow
                 }
             }
-        }
-        if ($failedFiles.Count) {
-            Write-Host "  $($failedFiles.Count) file(s) not collected: $($failedFiles -join ', ')" -ForegroundColor Yellow
+
+            if (-not $got) {
+                for ($attempt = 1; $attempt -le 3 -and -not $got; $attempt++) {
+                    try {
+                        if (-not (Test-SessionAlive $session)) {
+                            Remove-PSSession $session -ErrorAction SilentlyContinue
+                            $session = New-TargetSession -Server $server -Cred $cred -Method $Authentication
+                            if (-not $session) { break }
+                        }
+                        Copy-Item -FromSession $session -Path $pack.Path -Destination $localZip -Force -ErrorAction Stop
+                        $got = $true
+                    }
+                    catch {
+                        if ($attempt -eq 3) { Write-Warning "    could not transfer the archive: $(($_.Exception.Message -split "`n")[0])" }
+                        else { Start-Sleep -Seconds 3 }
+                    }
+                }
+            }
+
+            if ($got) {
+                try {
+                    Expand-Archive -Path $localZip -DestinationPath $localDir -Force
+                    $copied = @(Get-ChildItem $localDir -Filter *.csv -File).Count
+                    Remove-Item $localZip -Force -ErrorAction SilentlyContinue
+                    Write-Host "  collected $copied file(s) into $localDir" -ForegroundColor Green
+                    $detail = "$copied files"
+                }
+                catch {
+                    Write-Host "  archive arrived but could not be unpacked: $($_.Exception.Message)" -ForegroundColor Red
+                    Write-Host "  it is still here: $localZip" -ForegroundColor DarkYellow
+                    $detail = 'archive not unpacked'
+                    $status = 'partial'
+                }
+            }
+            else {
+                $detail = 'transfer failed'
+                $status = 'partial'
+            }
         }
 
-        Write-Host "  collected $copied file(s) into $localDir" -ForegroundColor Green
-        $detail = "$copied files"
-
+        # ---------------------------------------------------------------
+        # Clean up: the working folder, the archive in TEMP and the zips the
+        # wrappers built. Nothing about the domain should stay on the host.
+        # ---------------------------------------------------------------
         if (-not $KeepRemote) {
             try {
-                Invoke-WithSession -SessionRef ([ref]$session) -Server $server -Cred $cred -Method $Authentication `
-                    -ArgumentList @($remoteRoot) -Script {
-                    param($root)
+                $left = Invoke-WithSession -SessionRef ([ref]$session) -Server $server -Cred $cred -Method $Authentication `
+                    -ArgumentList @($remoteRoot, $archiveName) -Script {
+                    param($root, $name)
                     Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+                    Remove-Item (Join-Path $env:TEMP $name) -Force -ErrorAction SilentlyContinue
+
+                    # drop the parent folder too once the last domain is gone
+                    $parent = Split-Path $root -Parent
+                    if ((Test-Path $parent) -and -not (Get-ChildItem $parent -Force)) {
+                        Remove-Item $parent -Force -ErrorAction SilentlyContinue
+                    }
+
+                    @(Get-ChildItem $root -Recurse -Force -ErrorAction SilentlyContinue).Count
                 }
+                if ($left) { Write-Host "  $left item(s) still on the controller" -ForegroundColor DarkYellow }
+                else { Write-Host "  controller cleaned" -ForegroundColor DarkGray }
             }
             catch { Write-Warning "  could not clean up $remoteRoot on the controller" }
-            Write-Host "  working folder removed from the controller" -ForegroundColor DarkGray
         }
 
         $results.Add([PSCustomObject]@{ Domain = $dom; Server = $server; Status = $status; Files = $copied; Detail = $detail })
