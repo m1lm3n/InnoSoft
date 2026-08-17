@@ -52,6 +52,12 @@
     controller: Get-NetConnectionProfile, then Restart-Service NlaSvc -Force.
 
     Results land in <LocalRoot>\<domain>\<date>\ on this machine.
+
+    Collection runs on the controller, analysis runs here. That split
+    matters: every analyzer compares the current run with the previous one,
+    and that history only exists locally - the working folder on the
+    controller is wiped after each run. Use -analyzeonserver to go back to
+    analysing remotely, at the cost of losing the comparison.
 #>
 
 [CmdletBinding()]
@@ -107,10 +113,16 @@ param(
     [string]$Authentication = 'Negotiate',
 
     # Leave the working folder on the controller
-    [switch]$KeepRemote
+    [switch]$KeepRemote,
+
+    # Run the analysis on the controller instead of here. Off by default:
+    # the analyzers compare against the previous run, and that history lives
+    # locally, not on a controller whose working folder is wiped every time.
+    [switch]$AnalyzeOnServer
 )
 
 $ErrorActionPreference = 'Stop'
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # ---------------------------------------------------------------
 # Credential handling
@@ -500,6 +512,7 @@ $today = (Get-Date).ToString('yyyy-MM-dd')
 
 Write-Host ""
 Write-Host "Toolkits: $($toolkits -join ', ')" -ForegroundColor Cyan
+Write-Host ("Analysis: " + $(if ($AnalyzeOnServer) { 'on the controller (no history there, so no comparison)' } else { 'here, comparing with the previous run' })) -ForegroundColor Cyan
 Write-Host "Results:  $LocalRoot" -ForegroundColor Cyan
 
 $results = New-Object System.Collections.Generic.List[object]
@@ -619,12 +632,13 @@ foreach ($dom in $selected) {
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
             $out = Invoke-WithSession -SessionRef ([ref]$session) -Server $server -Cred $cred -Method $Authentication `
-                -ArgumentList @($RemoteScripts, $kit, $dom, $server, $remoteRoot) -Script {
-                param($scripts, $kit, $dom, $srv, $root)
+                -ArgumentList @($RemoteScripts, $kit, $dom, $server, $remoteRoot, (-not $AnalyzeOnServer)) -Script {
+                param($scripts, $kit, $dom, $srv, $root, $skipAnalyze)
                 Set-Location $scripts
                 $wrapper = ".\run-$kit.ps1"
                 if (-not (Test-Path $wrapper)) { throw "$wrapper not found on the controller - deploy first" }
-                & $wrapper -Domain $dom -Server $srv -Root $root
+                if ($skipAnalyze) { & $wrapper -Domain $dom -Server $srv -Root $root -SkipAnalyze }
+                else { & $wrapper -Domain $dom -Server $srv -Root $root }
             }
 
             $sw.Stop()
@@ -723,6 +737,38 @@ foreach ($dom in $selected) {
                     Remove-Item $localZip -Force -ErrorAction SilentlyContinue
                     Write-Host "  collected $copied file(s) into $localDir" -ForegroundColor Green
                     $detail = "$copied files"
+
+                    # ---------------------------------------------------
+                    # Analyse here, where the history of previous runs is.
+                    # ---------------------------------------------------
+                    if (-not $AnalyzeOnServer) {
+                        $prevDir = Get-ChildItem (Join-Path $LocalRoot $dom) -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' -and $_.Name -ne $today } |
+                        Sort-Object Name -Descending | Select-Object -First 1
+
+                        if ($prevDir) { Write-Host "  comparing against $($prevDir.Name)" -ForegroundColor DarkGray }
+                        else { Write-Host "  no earlier run to compare with" -ForegroundColor DarkGray }
+
+                        foreach ($an in 'Analyze-GpoMap', 'Analyze-AdHealth', 'Analyze-AdSecurity') {
+                            $script = Join-Path $here "$an.ps1"
+                            if (-not (Test-Path $script)) { continue }
+
+                            # skip an analyzer whose data was not collected
+                            $probe = switch ($an) {
+                                'Analyze-GpoMap' { "$dom-gpo.csv" }
+                                'Analyze-AdHealth' { "$dom-dcs.csv" }
+                                'Analyze-AdSecurity' { "$dom-protection.csv" }
+                            }
+                            if (-not (Test-Path (Join-Path $localDir $probe))) { continue }
+
+                            Write-Host ""
+                            Write-Host "  --- $an" -ForegroundColor Cyan
+                            $anArgs = @{ Path = $localDir; Domain = $dom }
+                            if ($prevDir) { $anArgs['ComparePath'] = $prevDir.FullName }
+                            try { & $script @anArgs }
+                            catch { Write-Warning "  $an failed: $($_.Exception.Message)" }
+                        }
+                    }
                 }
                 catch {
                     Write-Host "  archive arrived but could not be unpacked: $($_.Exception.Message)" -ForegroundColor Red
