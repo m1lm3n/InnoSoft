@@ -574,6 +574,16 @@ if ($needNtlm.Count) {
     }
 }
 
+# Reading the registry of a second host from inside a WinRM session needs
+# credential delegation, which is off by default. The hardening section of
+# Export-AdSecurity therefore sees only the controller it runs on. This is
+# expected, not a fault: the note below stops it looking like one.
+Write-Host ""
+Write-Host "Note: host hardening is read only for the controller each toolkit runs on." -ForegroundColor DarkGray
+Write-Host "      Other controllers and the CA report 'unauthorized' - that is credential" -ForegroundColor DarkGray
+Write-Host "      delegation, not a permissions problem. Run the toolkit on those hosts" -ForegroundColor DarkGray
+Write-Host "      directly to cover them." -ForegroundColor DarkGray
+
 foreach ($dom in $selected) {
     $server = $Targets[$dom].Server
     $trusted = ($Targets[$dom].Trusted -ne $false)
@@ -649,8 +659,10 @@ foreach ($dom in $selected) {
     try {
         $remoteRoot = Join-Path $RemoteWork $dom
 
+        $collectionLog = @()
+
         foreach ($kit in $toolkits) {
-            Write-Host "  running $kit..." -ForegroundColor Yellow
+            Write-Host "    collecting $kit..." -ForegroundColor DarkGray
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
             $out = Invoke-WithSession -SessionRef ([ref]$session) -Server $server -Cred $cred -Method $Authentication `
@@ -659,18 +671,38 @@ foreach ($dom in $selected) {
                 Set-Location $scripts
                 $wrapper = ".\run-$kit.ps1"
                 if (-not (Test-Path $wrapper)) { throw "$wrapper not found on the controller - deploy first" }
-                if ($skipAnalyze) { & $wrapper -Domain $dom -Server $srv -Root $root -SkipAnalyze }
-                else { & $wrapper -Domain $dom -Server $srv -Root $root }
+
+                # Write-Host on the remote side goes to the information
+                # stream, which WinRM forwards straight to the caller console
+                # and never returns as data. Redirecting stream 6 into the
+                # pipeline turns it into a value we can filter here instead
+                # of watching it scroll past.
+                if ($skipAnalyze) {
+                    $log = & $wrapper -Domain $dom -Server $srv -Root $root -SkipAnalyze 6>&1
+                }
+                else {
+                    $log = & $wrapper -Domain $dom -Server $srv -Root $root 6>&1
+                }
+                $log | ForEach-Object { "$_" }
             }
 
             $sw.Stop()
-            # keep only the lines worth seeing from here
-            $out | Where-Object {
-                "$_" -match 'COLLECTION|high|medium|RISK|DENY|WARNING|Error|Archive'
-            } | Select-Object -First 20 | ForEach-Object {
-                Write-Host "    $_" -ForegroundColor DarkGray
+
+            # Keep the full log for the report, show only the meaningful
+            # lines here: counts, warnings and anything that failed.
+            $collectionLog += @($out | ForEach-Object { "$_" })
+
+            $notable = @($out | Where-Object {
+                    "$_" -match 'COLLECTION INCOMPLETE|WARNING|FAILED|error|denied|not found|UNHANDLED'
+                })
+            foreach ($n in ($notable | Select-Object -First 8)) {
+                Write-Host "      $n" -ForegroundColor DarkYellow
             }
-            Write-Host ("    done in {0:N0}s" -f $sw.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+            if ($notable.Count -gt 8) {
+                Write-Host "      ... and $($notable.Count - 8) more, see the report" -ForegroundColor DarkYellow
+            }
+
+            Write-Host ("    {0} done in {1:N0}s" -f $kit, $sw.Elapsed.TotalSeconds) -ForegroundColor DarkGray
         }
 
         # ---------------------------------------------------------------
@@ -795,8 +827,15 @@ foreach ($dom in $selected) {
                             if ($script:CanReport) {
                                 $cap = Invoke-CapturedScript -Path $anPath -Arguments $anArgs
                                 $sections.Add([PSCustomObject]@{ Name = $kit.Name; Lines = $cap.Lines })
-                                if ($cap.Error) { Write-Host " failed: $($cap.Error)" -ForegroundColor Red }
-                                else { Write-Host " ok" -ForegroundColor Green }
+                                if ($cap.Error) {
+                                    Write-Host " failed: $(($cap.Error -split "`n")[0])" -ForegroundColor Red
+                                }
+                                elseif ($cap.Count -eq 0) {
+                                    Write-Host " no output captured" -ForegroundColor Yellow
+                                }
+                                else {
+                                    Write-Host " ok ($($cap.Count) lines)" -ForegroundColor Green
+                                }
                             }
                             else {
                                 try { & $anPath @anArgs | Out-Null; Write-Host " ok" -ForegroundColor Green }
@@ -820,6 +859,19 @@ foreach ($dom in $selected) {
                         $sevLine = "  findings: $($sevCount.high) high, $($sevCount.medium) medium, $($sevCount.low) low"
                         $sevColour = if ($sevCount.high -gt 0) { 'Red' } elseif ($sevCount.medium -gt 0) { 'Yellow' } else { 'Green' }
                         Write-Host $sevLine -ForegroundColor $sevColour
+
+                        # the collection log is worth keeping too: it is the
+                        # only place errors from the controller show up
+                        if ($collectionLog.Count) {
+                            $collLines = foreach ($cl in $collectionLog) {
+                                $colour = 'Gray'
+                                if ("$cl" -match 'WARNING|FAILED|error|denied|INCOMPLETE') { $colour = 'Yellow' }
+                                elseif ("$cl" -match 'COLLECTION COMPLETE|Archive:') { $colour = 'Green' }
+                                elseif ("$cl" -match '^\s*\[\d+/\d+\]') { $colour = 'Cyan' }
+                                , @([PSCustomObject]@{ Text = "$cl"; Color = $colour })
+                            }
+                            $sections.Add([PSCustomObject]@{ Name = 'Collection log'; Lines = @($collLines) })
+                        }
 
                         $reportData.Add([PSCustomObject]@{
                                 Domain   = $dom
@@ -905,6 +957,17 @@ if ($failed.Count) {
 }
 else {
     Write-Host "All $($results.Count) target(s) collected" -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------
+# Safety net: if a capture was interrupted the proxy would silence the
+# console for the rest of the session.
+# ---------------------------------------------------------------
+if ($script:CanReport -and (Get-Command Reset-ConsoleCapture -ErrorAction SilentlyContinue)) {
+    if (Test-Path function:global:Write-Host) {
+        Reset-ConsoleCapture
+        Write-Warning 'The output capture was still active and has been released.'
+    }
 }
 
 # ---------------------------------------------------------------

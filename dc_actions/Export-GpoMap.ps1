@@ -253,21 +253,21 @@ foreach ($t in $targets) {
         }
         if ($inh.GpoLinks.Count -eq 0) {
             $links.Add([PSCustomObject]@{
-                Target = $t; InheritBlocked = $inh.GpoInheritanceBlocked
-                Order = $null; DisplayName = $null; Enabled = $null
-                Enforced = $null; GpoId = $null
-            })
+                    Target = $t; InheritBlocked = $inh.GpoInheritanceBlocked
+                    Order = $null; DisplayName = $null; Enabled = $null
+                    Enforced = $null; GpoId = $null
+                })
         }
         foreach ($l in $inh.GpoLinks) {
             $links.Add([PSCustomObject]@{
-                Target         = $t
-                InheritBlocked = $inh.GpoInheritanceBlocked
-                Order          = $l.Order
-                DisplayName    = $l.DisplayName
-                Enabled        = $l.Enabled
-                Enforced       = $l.Enforced
-                GpoId          = $l.GpoId
-            })
+                    Target         = $t
+                    InheritBlocked = $inh.GpoInheritanceBlocked
+                    Order          = $l.Order
+                    DisplayName    = $l.DisplayName
+                    Enabled        = $l.Enabled
+                    Enforced       = $l.Enforced
+                    GpoId          = $l.GpoId
+                })
         }
     }
     catch { $linkFailures.Add($t) }
@@ -299,13 +299,13 @@ catch { Write-Warning "WMI filters: $($_.Exception.Message)" }
 Write-Step "[4/7] GPO inventory"
 
 $gpos = Get-GPO -All -Domain $Domain -Server $Server |
-    Select-Object DisplayName, Id, GpoStatus, CreationTime, ModificationTime,
-        @{N = 'Owner'; E = { $_.Owner } },
-        @{N = 'UserVersionAD'; E = { $_.User.DSVersion } },
-        @{N = 'UserVersionSysvol'; E = { $_.User.SysvolVersion } },
-        @{N = 'ComputerVersionAD'; E = { $_.Computer.DSVersion } },
-        @{N = 'ComputerVersionSysvol'; E = { $_.Computer.SysvolVersion } },
-        @{N = 'WmiFilter'; E = { $_.WmiFilter.Name } }
+Select-Object DisplayName, Id, GpoStatus, CreationTime, ModificationTime,
+@{N = 'Owner'; E = { $_.Owner } },
+@{N = 'UserVersionAD'; E = { $_.User.DSVersion } },
+@{N = 'UserVersionSysvol'; E = { $_.User.SysvolVersion } },
+@{N = 'ComputerVersionAD'; E = { $_.Computer.DSVersion } },
+@{N = 'ComputerVersionSysvol'; E = { $_.Computer.SysvolVersion } },
+@{N = 'WmiFilter'; E = { $_.WmiFilter.Name } }
 
 [void](Out-Table $gpos 'gpo')
 Write-Host "  policies: $(@($gpos).Count)"
@@ -325,15 +325,15 @@ function Read-GpoPermissions {
     }
     foreach ($p in $rows) {
         $perms.Add([PSCustomObject]@{
-            Gpo        = $Gpo.DisplayName
-            GpoId      = $Gpo.Id
-            Trustee    = $p.Trustee.Name
-            TrusteeSid = $p.Trustee.Sid.Value
-            SidType    = $p.Trustee.SidType
-            Permission = $p.Permission
-            Inherited  = $p.Inherited
-            Applies    = ($p.Permission -match 'Apply')
-        })
+                Gpo        = $Gpo.DisplayName
+                GpoId      = $Gpo.Id
+                Trustee    = $p.Trustee.Name
+                TrusteeSid = $p.Trustee.Sid.Value
+                SidType    = $p.Trustee.SidType
+                Permission = $p.Permission
+                Inherited  = $p.Inherited
+                Applies    = ($p.Permission -match 'Apply')
+            })
     }
 }
 
@@ -368,9 +368,9 @@ $stillMissing = @($gpos | Where-Object { $covered -notcontains $_.DisplayName })
 # Fallback: the most common S-1-5-21 prefix in the ACLs is this domain
 if (-not $domSid) {
     $prefixes = $perms |
-        Where-Object { $_.TrusteeSid -like 'S-1-5-21-*' } |
-        ForEach-Object { ($_.TrusteeSid -split '-')[0..6] -join '-' } |
-        Group-Object | Sort-Object Count -Descending
+    Where-Object { $_.TrusteeSid -like 'S-1-5-21-*' } |
+    ForEach-Object { ($_.TrusteeSid -split '-')[0..6] -join '-' } |
+    Group-Object | Sort-Object Count -Descending
     if ($prefixes) {
         $domSid = $prefixes[0].Name
         Write-Host "  domain SID derived from ACLs: $domSid" -ForegroundColor DarkYellow
@@ -404,14 +404,14 @@ try {
             if ($ace.ObjectType -ne $APPLY_GP_GUID) { continue }
             $sid = $ace.IdentityReference.Value
             $aces.Add([PSCustomObject]@{
-                Gpo        = $dn
-                GpoCn      = $cn
-                TrusteeSid = $sid
-                Trustee    = (Resolve-Sid $sid)
-                AceType    = $ace.AccessControlType    # Allow / Deny
-                Rights     = $ace.ActiveDirectoryRights
-                Inherited  = $ace.IsInherited
-            })
+                    Gpo        = $dn
+                    GpoCn      = $cn
+                    TrusteeSid = $sid
+                    Trustee    = (Resolve-Sid $sid)
+                    AceType    = $ace.AccessControlType    # Allow / Deny
+                    Rights     = $ace.ActiveDirectoryRights
+                    Inherited  = $ace.IsInherited
+                })
         }
     }
     [void](Out-Table $aces 'applyaces')
@@ -430,7 +430,7 @@ $skipRids = @('-512', '-513', '-515', '-516', '-518', '-519', '-520')
 $skipSids = @('S-1-5-11', 'S-1-1-0', 'S-1-5-9', 'S-1-5-18')
 
 $fromPerms = $perms | Where-Object { $_.Applies -and $_.SidType -eq 'Group' } |
-    Select-Object @{N = 'Sid'; E = { $_.TrusteeSid } }, @{N = 'Name'; E = { $_.Trustee } }
+Select-Object @{N = 'Sid'; E = { $_.TrusteeSid } }, @{N = 'Name'; E = { $_.Trustee } }
 $fromAces = $aces | Select-Object @{N = 'Sid'; E = { $_.TrusteeSid } }, @{N = 'Name'; E = { $_.Trustee } }
 $applyGroups = @($fromPerms) + @($fromAces) | Sort-Object Sid -Unique
 
@@ -442,13 +442,13 @@ foreach ($grp in $applyGroups) {
     Write-Progress -Activity 'Resolving groups' -Status $label -PercentComplete ($k * 100 / @($applyGroups).Count)
 
     $isBuiltin = ($skipSids -contains $grp.Sid) -or
-                 (@($skipRids | Where-Object { $grp.Sid -like "*$_" }).Count -gt 0)
+    (@($skipRids | Where-Object { $grp.Sid -like "*$_" }).Count -gt 0)
     if ($isBuiltin) {
         $members.Add([PSCustomObject]@{
-            GroupName = $label; GroupSid = $grp.Sid; MemberDn = $null
-            MemberName = $null; MemberClass = 'builtin-not-enumerated'
-            Note = 'well-known group, skipped'
-        })
+                GroupName = $label; GroupSid = $grp.Sid; MemberDn = $null
+                MemberName = $null; MemberClass = 'builtin-not-enumerated'
+                Note = 'well-known group, skipped'
+            })
         continue
     }
 
@@ -458,41 +458,57 @@ foreach ($grp in $applyGroups) {
 
         if ($memberDns.Count -eq 0) {
             $members.Add([PSCustomObject]@{
-                GroupName = $grp.Name; GroupSid = $grp.Sid; MemberDn = $null
-                MemberName = $null; MemberClass = 'empty'; Note = 'group has no members'
-            })
+                    GroupName = $grp.Name; GroupSid = $grp.Sid; MemberDn = $null
+                    MemberName = $null; MemberClass = 'empty'; Note = 'group has no members'
+                })
             continue
         }
         if ($memberDns.Count -gt $MaxGroupMembers) {
             $members.Add([PSCustomObject]@{
-                GroupName = $grp.Name; GroupSid = $grp.Sid; MemberDn = $null
-                MemberName = $null; MemberClass = 'too-many'
-                Note = "$($memberDns.Count) members, not enumerated"
-            })
+                    GroupName = $grp.Name; GroupSid = $grp.Sid; MemberDn = $null
+                    MemberName = $null; MemberClass = 'too-many'
+                    Note = "$($memberDns.Count) members, not enumerated"
+                })
             continue
         }
 
         foreach ($dn in $memberDns) {
             try {
                 $m = [ADSI]"LDAP://$Server/$dn"
+                $classes = @($m.Properties['objectClass'])
+                $cls = if ($classes.Count) { $classes[$classes.Count - 1] } else { 'unknown' }
+                $sam = @($m.Properties['sAMAccountName'])
+                # Resolved before the hash table on purpose: inside a hash
+                # table literal the comma in -replace 'a', 'b' is read as
+                # the separator between entries and the parser gives up.
+                $name = if ($sam.Count) { $sam[0] } else { ($dn -split ',')[0] -replace '^CN=', '' }
                 $members.Add([PSCustomObject]@{
-                    GroupName   = $grp.Name
-                    GroupSid    = $grp.Sid
-                    MemberDn    = $dn
-                    MemberName  = @($m.Properties['sAMAccountName'])[0]
-                    MemberClass = @($m.Properties['objectClass'])[-1]
-                    Note        = $null
-                })
+                        GroupName   = $label
+                        GroupSid    = $grp.Sid
+                        MemberDn    = $dn
+                        MemberName  = $name
+                        MemberClass = $cls
+                        Note        = $null
+                    })
             }
             catch {
                 $members.Add([PSCustomObject]@{
-                    GroupName = $grp.Name; GroupSid = $grp.Sid; MemberDn = $dn
-                    MemberName = $null; MemberClass = 'unresolved'; Note = $_.Exception.Message
-                })
+                        GroupName = $grp.Name; GroupSid = $grp.Sid; MemberDn = $dn
+                        MemberName = $null; MemberClass = 'unresolved'; Note = $_.Exception.Message
+                    })
             }
         }
     }
-    catch { Write-Warning "$($grp.Name) : $($_.Exception.Message)" }
+    catch {
+        # $grp.Name is empty when the SID could not be translated, which is
+        # exactly when this fires, so report the SID instead of nothing
+        Write-Warning "group $($grp.Sid) : $(($_.Exception.Message -split "`n")[0])"
+        $members.Add([PSCustomObject]@{
+                GroupName = $label; GroupSid = $grp.Sid; MemberDn = $null
+                MemberName = $null; MemberClass = 'unresolved-group'
+                Note = $_.Exception.Message
+            })
+    }
 }
 Write-Progress -Activity 'Resolving groups' -Completed
 [void](Out-Table $members 'groupmembers')
@@ -513,23 +529,23 @@ $failedOus = @($linkFailures | ForEach-Object { [string]$_ })
 # object, and the exception alone does not say which property caused it.
 $metaFields = [ordered]@{}
 $metaSpec = @(
-    @{ Name = 'Domain';         Get = { [string]$Domain } }
-    @{ Name = 'Server';         Get = { [string]$Server } }
-    @{ Name = 'BaseDn';         Get = { [string]$baseDn } }
-    @{ Name = 'DomainSid';      Get = { [string]$domSid } }
-    @{ Name = 'CollectedAt';    Get = { $startedAt.ToString('yyyy-MM-dd HH:mm:ss') } }
-    @{ Name = 'FinishedAt';     Get = { $finishedAt.ToString('yyyy-MM-dd HH:mm:ss') } }
-    @{ Name = 'ElapsedSec';     Get = { [double][math]::Round($sw.Elapsed.TotalSeconds, 1) } }
-    @{ Name = 'CollectedBy';    Get = { [string]("$env:USERNAME on $env:COMPUTERNAME") } }
-    @{ Name = 'OuCount';        Get = { [int]@($ous).Count } }
-    @{ Name = 'LinkCount';      Get = { [int]@($links | Where-Object { $_.DisplayName }).Count } }
-    @{ Name = 'GpoCount';       Get = { [int]@($gpos).Count } }
-    @{ Name = 'PermCount';      Get = { [int]$perms.Count } }
-    @{ Name = 'AceCount';       Get = { [int]$aces.Count } }
-    @{ Name = 'GroupCount';     Get = { [int]@($applyGroups).Count } }
-    @{ Name = 'Complete';       Get = { [bool]$complete } }
+    @{ Name = 'Domain'; Get = { [string]$Domain } }
+    @{ Name = 'Server'; Get = { [string]$Server } }
+    @{ Name = 'BaseDn'; Get = { [string]$baseDn } }
+    @{ Name = 'DomainSid'; Get = { [string]$domSid } }
+    @{ Name = 'CollectedAt'; Get = { $startedAt.ToString('yyyy-MM-dd HH:mm:ss') } }
+    @{ Name = 'FinishedAt'; Get = { $finishedAt.ToString('yyyy-MM-dd HH:mm:ss') } }
+    @{ Name = 'ElapsedSec'; Get = { [double][math]::Round($sw.Elapsed.TotalSeconds, 1) } }
+    @{ Name = 'CollectedBy'; Get = { [string]("$env:USERNAME on $env:COMPUTERNAME") } }
+    @{ Name = 'OuCount'; Get = { [int]@($ous).Count } }
+    @{ Name = 'LinkCount'; Get = { [int]@($links | Where-Object { $_.DisplayName }).Count } }
+    @{ Name = 'GpoCount'; Get = { [int]@($gpos).Count } }
+    @{ Name = 'PermCount'; Get = { [int]$perms.Count } }
+    @{ Name = 'AceCount'; Get = { [int]$aces.Count } }
+    @{ Name = 'GroupCount'; Get = { [int]@($applyGroups).Count } }
+    @{ Name = 'Complete'; Get = { [bool]$complete } }
     @{ Name = 'MissingAclGpos'; Get = { [string]($missingNames -join '; ') } }
-    @{ Name = 'FailedLinkOus';  Get = { [string]($failedOus -join '; ') } }
+    @{ Name = 'FailedLinkOus'; Get = { [string]($failedOus -join '; ') } }
 )
 
 foreach ($f in $metaSpec) {
@@ -589,7 +605,7 @@ Write-Host ("=" * 52) -ForegroundColor Cyan
 Write-Host ("  Started:       " + $startedAt.ToString('yyyy-MM-dd HH:mm:ss'))
 Write-Host ("  Finished:      " + $finishedAt.ToString('yyyy-MM-dd HH:mm:ss'))
 Write-Host ("  Total elapsed: " + (Format-Span $sw.Elapsed) +
-            "  (" + [math]::Round($sw.Elapsed.TotalMinutes, 1) + " min)") -ForegroundColor Green
+    "  (" + [math]::Round($sw.Elapsed.TotalMinutes, 1) + " min)") -ForegroundColor Green
 Write-Host ("=" * 52) -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Next step:  .\Analyze-GpoMap.ps1 -Path '$OutDir'" -ForegroundColor Cyan

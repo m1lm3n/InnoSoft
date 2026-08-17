@@ -23,31 +23,14 @@
         @{ Text = 'MS16-072 RISK: 1'; Color = 'Red' }
 #>
 
-$script:Lines = New-Object System.Collections.Generic.List[object]
-$script:Current = New-Object System.Collections.Generic.List[object]
-$script:Echo = $false
-$script:Active = $false
-
-function Add-CapturedSegment {
-    param(
-        [string]$Text,
-        [string]$Color,
-        [switch]$NoNewline
-    )
-
-    # A single Write-Host may carry embedded newlines; split so the report
-    # keeps one line per line rather than one blob per call.
-    $parts = "$Text" -split "`r?`n"
-
-    for ($i = 0; $i -lt $parts.Count; $i++) {
-        $script:Current.Add([PSCustomObject]@{ Text = $parts[$i]; Color = $Color })
-        $isLast = ($i -eq $parts.Count - 1)
-        if (-not $isLast -or -not $NoNewline) {
-            $script:Lines.Add(@($script:Current.ToArray()))
-            $script:Current = New-Object System.Collections.Generic.List[object]
-        }
-    }
-}
+# State lives in the global scope on purpose. The proxy is registered as a
+# global function, and a script block registered that way loses its link to
+# the module scope, so anything it referenced there would be unreachable.
+# Keeping everything global is less elegant and actually works.
+$global:AuditCaptureLines = $null
+$global:AuditCaptureCurrent = $null
+$global:AuditCaptureEcho = $false
+$global:AuditCaptureActive = $false
 
 function Start-ConsoleCapture {
     <#
@@ -60,12 +43,12 @@ function Start-ConsoleCapture {
     [CmdletBinding()]
     param([switch]$Echo)
 
-    if ($script:Active) { Stop-ConsoleCapture | Out-Null }
+    if ($global:AuditCaptureActive) { [void](Stop-ConsoleCapture) }
 
-    $script:Lines = New-Object System.Collections.Generic.List[object]
-    $script:Current = New-Object System.Collections.Generic.List[object]
-    $script:Echo = [bool]$Echo
-    $script:Active = $true
+    $global:AuditCaptureLines = New-Object System.Collections.Generic.List[object]
+    $global:AuditCaptureCurrent = New-Object System.Collections.Generic.List[object]
+    $global:AuditCaptureEcho = [bool]$Echo
+    $global:AuditCaptureActive = $true
 
     $proxy = {
         [CmdletBinding()]
@@ -80,17 +63,34 @@ function Start-ConsoleCapture {
         )
 
         process {
-            $text = ''
-            if ($null -ne $Object) {
-                $text = ($Object | ForEach-Object { "$_" }) -join "$Separator"
+            # A failure here would silence the console for the rest of the
+            # session, so nothing in this block is allowed to throw.
+            try {
+                $text = ''
+                if ($null -ne $Object) {
+                    $text = ($Object | ForEach-Object { "$_" }) -join "$Separator"
+                }
+
+                $colour = 'Gray'
+                if ($PSBoundParameters.ContainsKey('ForegroundColor')) { $colour = "$ForegroundColor" }
+
+                # one Write-Host may carry several lines
+                $parts = "$text" -split "`r?`n"
+                for ($i = 0; $i -lt $parts.Count; $i++) {
+                    $global:AuditCaptureCurrent.Add([PSCustomObject]@{ Text = $parts[$i]; Color = $colour })
+                    $isLast = ($i -eq $parts.Count - 1)
+                    if (-not $isLast -or -not $NoNewline) {
+                        $global:AuditCaptureLines.Add(@($global:AuditCaptureCurrent.ToArray()))
+                        $global:AuditCaptureCurrent = New-Object System.Collections.Generic.List[object]
+                    }
+                }
+            }
+            catch {
+                # fall through to the real cmdlet rather than lose the line
+                $global:AuditCaptureEcho = $true
             }
 
-            $colour = 'Gray'
-            if ($PSBoundParameters.ContainsKey('ForegroundColor')) { $colour = "$ForegroundColor" }
-
-            Add-CapturedSegment -Text $text -Color $colour -NoNewline:$NoNewline
-
-            if ($script:Echo) {
+            if ($global:AuditCaptureEcho) {
                 $fwd = @{}
                 foreach ($k in $PSBoundParameters.Keys) { $fwd[$k] = $PSBoundParameters[$k] }
                 Microsoft.PowerShell.Utility\Write-Host @fwd
@@ -105,27 +105,46 @@ function Stop-ConsoleCapture {
     <#
         .SYNOPSIS
         Restores the real Write-Host and returns everything captured.
+        Safe to call even if capture was never started.
     #>
     [CmdletBinding()]
     param()
 
-    if ($script:Current.Count) {
-        $script:Lines.Add(@($script:Current.ToArray()))
-        $script:Current = New-Object System.Collections.Generic.List[object]
+    try {
+        if ($global:AuditCaptureCurrent -and $global:AuditCaptureCurrent.Count) {
+            $global:AuditCaptureLines.Add(@($global:AuditCaptureCurrent.ToArray()))
+        }
     }
+    catch { }
 
+    $global:AuditCaptureCurrent = New-Object System.Collections.Generic.List[object]
     Remove-Item -Path function:global:Write-Host -Force -ErrorAction SilentlyContinue
-    $script:Active = $false
+    $global:AuditCaptureActive = $false
 
-    $out = @($script:Lines.ToArray())
-    $script:Lines = New-Object System.Collections.Generic.List[object]
+    $out = @()
+    if ($global:AuditCaptureLines) { $out = @($global:AuditCaptureLines.ToArray()) }
+    $global:AuditCaptureLines = New-Object System.Collections.Generic.List[object]
     return , $out
+}
+
+function Reset-ConsoleCapture {
+    <#
+        .SYNOPSIS
+        Emergency release: removes the proxy whatever state it is in.
+        Call this if console output ever goes quiet.
+    #>
+    [CmdletBinding()]
+    param()
+    Remove-Item -Path function:global:Write-Host -Force -ErrorAction SilentlyContinue
+    $global:AuditCaptureActive = $false
+    $global:AuditCaptureLines = New-Object System.Collections.Generic.List[object]
+    $global:AuditCaptureCurrent = New-Object System.Collections.Generic.List[object]
 }
 
 function Test-ConsoleCapture {
     [CmdletBinding()]
     param()
-    return $script:Active
+    return [bool]$global:AuditCaptureActive
 }
 
 function Invoke-CapturedScript {
@@ -149,15 +168,21 @@ function Invoke-CapturedScript {
 
     Start-ConsoleCapture -Echo:$Echo
     $err = $null
+    $lines = @()
     try { & $Path @Arguments | Out-Null }
     catch { $err = $_.Exception.Message }
-    finally { $lines = Stop-ConsoleCapture }
+    finally {
+        $lines = Stop-ConsoleCapture
+        # belt and braces: the proxy must never outlive this call
+        if (Test-Path function:global:Write-Host) { Reset-ConsoleCapture }
+    }
 
     return [PSCustomObject]@{
         Lines = $lines
         Error = $err
+        Count = @($lines).Count
     }
 }
 
 Export-ModuleMember -Function Start-ConsoleCapture, Stop-ConsoleCapture,
-    Test-ConsoleCapture, Invoke-CapturedScript
+    Test-ConsoleCapture, Reset-ConsoleCapture, Invoke-CapturedScript
