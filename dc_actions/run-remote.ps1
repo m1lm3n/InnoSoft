@@ -118,11 +118,32 @@ param(
     # Run the analysis on the controller instead of here. Off by default:
     # the analyzers compare against the previous run, and that history lives
     # locally, not on a controller whose working folder is wiped every time.
-    [switch]$AnalyzeOnServer
+    [switch]$AnalyzeOnServer,
+
+    # Skip building the HTML report
+    [switch]$NoReport,
+
+    # Open the report when it is finished
+    [switch]$OpenReport,
+
+    # Where the report goes
+    [string]$ReportPath
 )
 
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Output capture and report rendering live in their own modules so this
+# script stays about running things, not about formatting them.
+$script:CanReport = $true
+foreach ($mod in 'AuditCapture', 'AuditHtml') {
+    $modPath = Join-Path $here "$mod.psm1"
+    if (Test-Path $modPath) { Import-Module $modPath -Force -DisableNameChecking }
+    else {
+        Write-Warning "$mod.psm1 not found next to this script - the HTML report will be skipped"
+        $script:CanReport = $false
+    }
+}
 
 # ---------------------------------------------------------------
 # Credential handling
@@ -516,6 +537,7 @@ Write-Host ("Analysis: " + $(if ($AnalyzeOnServer) { 'on the controller (no hist
 Write-Host "Results:  $LocalRoot" -ForegroundColor Cyan
 
 $results = New-Object System.Collections.Generic.List[object]
+$reportData = New-Object System.Collections.Generic.List[object]
 
 # ---------------------------------------------------------------
 # TrustedHosts for the domains with no trust
@@ -749,25 +771,61 @@ foreach ($dom in $selected) {
                         if ($prevDir) { Write-Host "  comparing against $($prevDir.Name)" -ForegroundColor DarkGray }
                         else { Write-Host "  no earlier run to compare with" -ForegroundColor DarkGray }
 
-                        foreach ($an in 'Analyze-GpoMap', 'Analyze-AdHealth', 'Analyze-AdSecurity') {
-                            $script = Join-Path $here "$an.ps1"
-                            if (-not (Test-Path $script)) { continue }
+                        # Analyzer output is captured rather than printed:
+                        # three reports across six domains is unreadable in a
+                        # console. It all lands in the HTML report instead.
+                        $sections = New-Object System.Collections.Generic.List[object]
 
-                            # skip an analyzer whose data was not collected
-                            $probe = switch ($an) {
-                                'Analyze-GpoMap' { "$dom-gpo.csv" }
-                                'Analyze-AdHealth' { "$dom-dcs.csv" }
-                                'Analyze-AdSecurity' { "$dom-protection.csv" }
-                            }
-                            if (-not (Test-Path (Join-Path $localDir $probe))) { continue }
+                        $kits = @(
+                            @{ Script = 'Analyze-GpoMap'; Name = 'Group Policy'; Probe = "$dom-gpo.csv" }
+                            @{ Script = 'Analyze-AdHealth'; Name = 'AD Health'; Probe = "$dom-dcs.csv" }
+                            @{ Script = 'Analyze-AdSecurity'; Name = 'AD Security'; Probe = "$dom-protection.csv" }
+                        )
 
-                            Write-Host ""
-                            Write-Host "  --- $an" -ForegroundColor Cyan
+                        foreach ($kit in $kits) {
+                            $anPath = Join-Path $here "$($kit.Script).ps1"
+                            if (-not (Test-Path $anPath)) { continue }
+                            if (-not (Test-Path (Join-Path $localDir $kit.Probe))) { continue }
+
                             $anArgs = @{ Path = $localDir; Domain = $dom }
                             if ($prevDir) { $anArgs['ComparePath'] = $prevDir.FullName }
-                            try { & $script @anArgs }
-                            catch { Write-Warning "  $an failed: $($_.Exception.Message)" }
+
+                            Write-Host "    analysing $($kit.Name)..." -NoNewline -ForegroundColor DarkGray
+
+                            if ($script:CanReport) {
+                                $cap = Invoke-CapturedScript -Path $anPath -Arguments $anArgs
+                                $sections.Add([PSCustomObject]@{ Name = $kit.Name; Lines = $cap.Lines })
+                                if ($cap.Error) { Write-Host " failed: $($cap.Error)" -ForegroundColor Red }
+                                else { Write-Host " ok" -ForegroundColor Green }
+                            }
+                            else {
+                                try { & $anPath @anArgs | Out-Null; Write-Host " ok" -ForegroundColor Green }
+                                catch { Write-Host " failed: $($_.Exception.Message)" -ForegroundColor Red }
+                            }
                         }
+
+                        # summarise on one line instead of dumping the reports
+                        $sevCount = @{ high = 0; medium = 0; low = 0 }
+                        foreach ($ff in @("$dom-findings.csv", "$dom-adhealth-findings.csv", "$dom-adsecurity-findings.csv")) {
+                            $ffp = Join-Path $localDir $ff
+                            if (-not (Test-Path $ffp)) { continue }
+                            try {
+                                foreach ($r in (Import-Csv $ffp)) {
+                                    $k = "$($r.Severity)".ToLower()
+                                    if ($sevCount.ContainsKey($k)) { $sevCount[$k]++ }
+                                }
+                            }
+                            catch { }
+                        }
+                        $sevLine = "  findings: $($sevCount.high) high, $($sevCount.medium) medium, $($sevCount.low) low"
+                        $sevColour = if ($sevCount.high -gt 0) { 'Red' } elseif ($sevCount.medium -gt 0) { 'Yellow' } else { 'Green' }
+                        Write-Host $sevLine -ForegroundColor $sevColour
+
+                        $reportData.Add([PSCustomObject]@{
+                                Domain   = $dom
+                                DataPath = $localDir
+                                Sections = @($sections.ToArray())
+                            })
                     }
                 }
                 catch {
@@ -849,8 +907,27 @@ else {
     Write-Host "All $($results.Count) target(s) collected" -ForegroundColor Green
 }
 
+# ---------------------------------------------------------------
+# HTML report
+# ---------------------------------------------------------------
+if (-not $NoReport -and $script:CanReport -and $reportData.Count) {
+    if (-not $ReportPath) {
+        $ReportPath = Join-Path $LocalRoot ("audit-report-$today.html")
+    }
+    try {
+        $rep = New-AuditHtmlReport -Report @($reportData.ToArray()) -Path $ReportPath `
+            -Title "Active Directory audit - $today" -Open:$OpenReport
+
+        Write-Host ""
+        Write-Host "Report: $($rep.Path)" -ForegroundColor Green
+        Write-Host ("  $($rep.Domains) domain(s), $($rep.High) high, $($rep.Medium) medium, $($rep.Low) low, $($rep.SizeKb) KB") -ForegroundColor DarkGray
+        if (-not $OpenReport) { Write-Host "  open with: ii '$($rep.Path)'" -ForegroundColor DarkGray }
+    }
+    catch { Write-Warning "Could not build the report: $($_.Exception.Message)" }
+}
+
 Write-Host ""
-Write-Host "Analyse locally, no domain access needed:" -ForegroundColor DarkGray
+Write-Host "Raw data and per-domain analysis:" -ForegroundColor DarkGray
 Write-Host "  .\Analyze-GpoMap.ps1      -Path $LocalRoot\<domain>\$today" -ForegroundColor DarkGray
 Write-Host "  .\Analyze-AdHealth.ps1    -Path $LocalRoot\<domain>\$today" -ForegroundColor DarkGray
 Write-Host "  .\Analyze-AdSecurity.ps1  -Path $LocalRoot\<domain>\$today" -ForegroundColor DarkGray
