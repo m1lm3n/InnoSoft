@@ -127,7 +127,10 @@ param(
     [switch]$OpenReport,
 
     # Where the report goes
-    [string]$ReportPath
+    [string]$ReportPath,
+
+    # Alternative target table, defaults to targets.psd1 beside the script
+    [string]$TargetsFile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -447,40 +450,22 @@ function Invoke-WithSession {
 # ---------------------------------------------------------------
 # Target table - mirror of the one in deploy.ps1
 # ---------------------------------------------------------------
-# Trusted = $false means there is no trust with the management domain, so
-# Kerberos cannot work from a core64.com workstation and WinRM needs NTLM.
-# Verified 13.08.2026 with: nltest /domain_trusts /all_trusts /v
-#   core64.com trusts kkk.lo, xxx.lo, a.lo, c.lo
-#   nnn.lo and ttt.lo are standalone forests with no trust at all
-$Targets = [ordered]@{
-    'nnn.lo'     = @{ Server = 'dc-nnn.nnn.lo'; Trusted = $false
-        Extra = @('dc2-nnn.nnn.lo')
-        Note = 'users: reten, conversion, sales. No trust, NTLM only'
-    }
-    'kkk.lo'     = @{ Server = 'dc-kkk.kkk.lo'; Trusted = $true
-        Note = 'scouts, operators'
-    }
-    'xxx.lo'     = @{ Server = 'dc-xxx.xxx.lo'; Trusted = $true
-        Note = 'admin Silver'
-    }
-    'ttt.lo'     = @{ Server = 'dc-ttt.ttt.lo'; Trusted = $false
-        Note = 'single DC. No trust, NTLM only'
-    }
-    'a.lo'       = @{ Server = 'dc.a.lo'; Trusted = $true
-        Note = 'auth for OnlyOffice and Nextcloud, single DC'
-    }
-    'core64.com' = @{ Server = 'dc-dc1.core64.com'; Trusted = $true
-        Note = 'management domain'
-    }
+# ---------------------------------------------------------------
+# Targets come from targets.psd1, shared with deploy.ps1 and
+# Fix-NlaDependency.ps1. Trusted = $false marks the domains with no trust
+# to the management domain: Kerberos cannot work there, so those hosts need
+# NTLM and an entry in TrustedHosts.
+# ---------------------------------------------------------------
+$targetsModule = Join-Path $here 'AuditTargets.psm1'
+if (-not (Test-Path $targetsModule)) {
+    throw "AuditTargets.psm1 not found next to this script. It reads targets.psd1."
 }
+Import-Module $targetsModule -Force -DisableNameChecking
+
+$Targets = Get-AuditTargets -Path $TargetsFile
 
 if ($List) {
-    Write-Host ""
-    Write-Host "Targets:" -ForegroundColor Cyan
-    foreach ($k in $Targets.Keys) {
-        Write-Host ("  {0,-12} {1,-24} {2}" -f $k, $Targets[$k].Server, $Targets[$k].Note)
-    }
-    Write-Host ""
+    Show-AuditTargets -Path $TargetsFile
     return
 }
 
