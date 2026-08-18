@@ -36,10 +36,14 @@
         Fix-*.ps1        maintenance scripts
 
     What deliberately does not
-        deploy.ps1, run-remote.ps1   deployment and orchestration are driven
-                                     from the workstation
-        Audit*.psm1, targets.psd1    output capture, HTML rendering and the
-                                     target table are local concerns
+        deploy.ps1, run-remote.ps1      deployment and orchestration are
+                                         driven from the workstation
+        Audit*.psm1, targets.psd1,      output capture, HTML rendering, the
+        db.psd1                         target table and the database
+                                         connection settings are local concerns
+        Initialize-AuditDatabase.ps1     sets up the SQL Server database on
+                                         the workstation/server itself, never
+                                         run against a controller
 
     That distinction matters: a module dropped on a controller and imported
     by mistake will execute, and a collector saved under a module name will
@@ -67,10 +71,12 @@ param(
     # reporting modules run on the workstation and would either do nothing
     # there or, worse, execute on import.
     [string[]]$Exclude = @(
-        'deploy.ps1',          # deployment is driven from here, not from a DC
-        'run-remote.ps1',      # same
-        'Audit*.psm1',         # capture, HTML and target modules are local
-        'targets.psd1'         # the target table is local too
+        'deploy.ps1',                       # deployment is driven from here, not from a DC
+        'run-remote.ps1',                   # same
+        'Initialize-AuditDatabase.ps1',      # sets up SQL locally, never run on a DC
+        'Audit*.psm1',                       # capture, HTML, target and DB modules are local
+        'targets.psd1',                      # the target table is local too
+        'db.psd1'                            # database connection settings are local too
     ),
 
     # Source folder, defaults to the folder this script lives in

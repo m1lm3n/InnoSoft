@@ -136,15 +136,37 @@ param(
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-# Output capture and report rendering live in their own modules so this
-# script stays about running things, not about formatting them.
+# Output capture, report rendering and the SQL store live in their own
+# modules so this script stays about running things, not about formatting
+# or persisting them.
 $script:CanReport = $true
-foreach ($mod in 'AuditCapture', 'AuditHtml') {
+foreach ($mod in 'AuditCapture', 'AuditHtml', 'AuditDb') {
     $modPath = Join-Path $here "$mod.psm1"
     if (Test-Path $modPath) { Import-Module $modPath -Force -DisableNameChecking }
+    elseif ($mod -eq 'AuditDb') {
+        Write-Warning "AuditDb.psm1 not found next to this script - continuing without SQL, CSV folders will be kept on disk"
+    }
     else {
         Write-Warning "$mod.psm1 not found next to this script - the HTML report will be skipped"
         $script:CanReport = $false
+    }
+}
+
+# SQL is the durable store now (see AuditDb.psm1's header): a domain's
+# dated CSV folder is only deleted once its data has landed in the
+# database. If SQL is unreachable this whole run falls back to the old
+# behaviour instead - folders are kept on disk and the baseline comparison
+# scans them by date - rather than losing a day's collection to a database
+# hiccup.
+$script:CanUseDb = $false
+if (Get-Command Test-AuditDbConnection -ErrorAction SilentlyContinue) {
+    if (Test-AuditDbConnection) {
+        $script:CanUseDb = $true
+    }
+    else {
+        Write-Host ""
+        Write-Host "SQL Server unreachable - CSV folders will be kept on disk this run instead of loaded and deleted." -ForegroundColor Yellow
+        Write-Host "Run .\Initialize-AuditDatabase.ps1 to check the setup." -ForegroundColor Yellow
     }
 }
 
@@ -800,12 +822,46 @@ foreach ($dom in $selected) {
                             })
                     }
                     else {
-                        $prevDir = Get-ChildItem (Join-Path $LocalRoot $dom) -Directory -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' -and $_.Name -ne $today } |
-                        Sort-Object Name -Descending | Select-Object -First 1
+                        # Baseline for the comparison: the previous run for
+                        # this domain, either looked up in SQL and pulled
+                        # back out as a throwaway CSV folder (Export-RunToCsvFolder,
+                        # byte-faithful to what the collector originally
+                        # wrote), or - when SQL is unreachable this run -
+                        # the previous dated folder still on disk, exactly
+                        # as before.
+                        $prevRunId = $null
+                        $prevDir = $null
+                        $compareDir = $null
+                        $rehydrateDir = $null
 
-                        if ($prevDir) { Write-Host "  comparing against $($prevDir.Name)" -ForegroundColor DarkGray }
-                        else { Write-Host "  no earlier run to compare with" -ForegroundColor DarkGray }
+                        if ($script:CanUseDb) {
+                            try {
+                                $prevRun = Get-PreviousRunId -Domain $dom
+                                if ($prevRun) {
+                                    $prevRunId = $prevRun.RunId
+                                    $rehydrateDir = Join-Path $env:TEMP "audit-rehydrate\$dom\$($prevRun.RunId)"
+                                    if (Test-Path $rehydrateDir) { Remove-Item $rehydrateDir -Recurse -Force -ErrorAction SilentlyContinue }
+                                    Export-RunToCsvFolder -RunId $prevRun.RunId -Domain $dom -OutDir $rehydrateDir
+                                    $compareDir = $rehydrateDir
+                                    Write-Host ("  comparing against run {0} ({1:yyyy-MM-dd})" -f $prevRun.RunId, $prevRun.RunDate) -ForegroundColor DarkGray
+                                }
+                                else { Write-Host "  no earlier run to compare with" -ForegroundColor DarkGray }
+                            }
+                            catch {
+                                Write-Host "  could not rehydrate the previous run from SQL, comparing without a baseline: $($_.Exception.Message)" -ForegroundColor Yellow
+                            }
+                        }
+                        else {
+                            $prevDir = Get-ChildItem (Join-Path $LocalRoot $dom) -Directory -ErrorAction SilentlyContinue |
+                            Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' -and $_.Name -ne $today } |
+                            Sort-Object Name -Descending | Select-Object -First 1
+
+                            if ($prevDir) {
+                                $compareDir = $prevDir.FullName
+                                Write-Host "  comparing against $($prevDir.Name)" -ForegroundColor DarkGray
+                            }
+                            else { Write-Host "  no earlier run to compare with" -ForegroundColor DarkGray }
+                        }
 
                         # Analyzer output is captured rather than printed:
                         # three reports across six domains is unreadable in a
@@ -824,7 +880,7 @@ foreach ($dom in $selected) {
                             if (-not (Test-Path (Join-Path $localDir $kit.Probe))) { continue }
 
                             $anArgs = @{ Path = $localDir; Domain = $dom }
-                            if ($prevDir) { $anArgs['ComparePath'] = $prevDir.FullName }
+                            if ($compareDir) { $anArgs['ComparePath'] = $compareDir }
 
                             Write-Host "    analysing $($kit.Name)..." -NoNewline -ForegroundColor DarkGray
 
@@ -891,11 +947,40 @@ foreach ($dom in $selected) {
                                 })
                         }
 
+                        # ---------------------------------------------------
+                        # Load this run into SQL. Only once that succeeds is
+                        # the local dated folder deleted (see AuditDb.psm1's
+                        # Save-AuditRun) - a failed load keeps the CSVs on
+                        # disk and the report falls back to reading them
+                        # directly, same as when SQL is unreachable entirely.
+                        # ---------------------------------------------------
+                        $runId = $null
+                        if ($script:CanUseDb) {
+                            try {
+                                $saved = Save-AuditRun -Domain $dom -Server $server `
+                                    -RunDate ([datetime]::ParseExact($today, 'yyyy-MM-dd', $null)) -DataPath $localDir
+                                $runId = $saved.RunId
+                                Write-Host "  saved to SQL as run $runId" -ForegroundColor DarkGray
+
+                                Remove-Item $localDir -Recurse -Force -ErrorAction SilentlyContinue
+                                Write-Host "  local CSVs removed, SQL is now the only copy" -ForegroundColor DarkGray
+                            }
+                            catch {
+                                Write-Host "  DB LOAD FAILED, CSVs kept at $localDir : $($_.Exception.Message)" -ForegroundColor Red
+                                $runId = $null
+                            }
+                        }
+                        if ($rehydrateDir -and (Test-Path $rehydrateDir)) {
+                            Remove-Item $rehydrateDir -Recurse -Force -ErrorAction SilentlyContinue
+                        }
+
                         $reportData.Add([PSCustomObject]@{
-                                Domain       = $dom
-                                DataPath     = $localDir
-                                BaselinePath = $(if ($prevDir) { $prevDir.FullName } else { $null })
-                                Sections     = @($sections.ToArray())
+                                Domain        = $dom
+                                DataPath      = $localDir
+                                BaselinePath  = $(if ($prevDir) { $prevDir.FullName } else { $null })
+                                RunId         = $runId
+                                PreviousRunId = $prevRunId
+                                Sections      = @($sections.ToArray())
                             })
                     }
                 }

@@ -57,10 +57,22 @@ function ConvertTo-CssClass {
 
 function Get-FindingsForDomain {
     <#
-        Collects every findings file produced for a domain and tags each row
-        with the toolkit it came from.
+        Collects every finding recorded for a domain and tags each row with
+        the toolkit it came from.
+
+        -RunId reads from SQL (Get-FindingsFromDb, exported by AuditDb.psm1
+        - the caller must have imported it already, same as this module
+        never imports its own dependencies). -DataPath/-Domain is the
+        original CSV-folder path, kept as the fallback used when a
+        domain's database load failed and its dated folder was left on
+        disk instead of deleted (see run-remote.ps1).
     #>
-    param([string]$DataPath, [string]$Domain)
+    param([int]$RunId, [string]$DataPath, [string]$Domain)
+
+    if ($RunId) {
+        try { return , @(Get-FindingsFromDb -RunId $RunId) }
+        catch { Write-Warning "Could not read findings for RunId $RunId from SQL: $($_.Exception.Message)"; return , @() }
+    }
 
     $map = @{
         "$Domain-findings.csv"            = 'Group Policy'
@@ -127,7 +139,14 @@ function Compare-FindingSets {
 }
 
 function Get-MetaForDomain {
-    param([string]$DataPath, [string]$Domain)
+    # -RunId reads from SQL (Get-RunMetaFromDb); -DataPath/-Domain is the
+    # CSV fallback - see Get-FindingsForDomain's comment above.
+    param([int]$RunId, [string]$DataPath, [string]$Domain)
+
+    if ($RunId) {
+        try { return Get-RunMetaFromDb -RunId $RunId }
+        catch { Write-Warning "Could not read metadata for RunId $RunId from SQL: $($_.Exception.Message)"; return [ordered]@{} }
+    }
 
     $out = [ordered]@{}
     foreach ($f in @("$Domain-meta.csv", "$Domain-adhealth-meta.csv", "$Domain-adsecurity-meta.csv")) {
@@ -185,8 +204,9 @@ function New-AuditHtmlReport {
     # ---------- totals ----------
     $grand = @{ high = 0; medium = 0; low = 0; new = 0; resolved = 0 }
     $prepared = foreach ($d in $domains) {
-        $findings = Get-FindingsForDomain -DataPath $d.DataPath -Domain $d.Domain
-        $meta = Get-MetaForDomain -DataPath $d.DataPath -Domain $d.Domain
+        $runId = $(if ($d.PSObject.Properties.Name -contains 'RunId') { $d.RunId } else { $null })
+        $findings = if ($runId) { Get-FindingsForDomain -RunId $runId } else { Get-FindingsForDomain -DataPath $d.DataPath -Domain $d.Domain }
+        $meta = if ($runId) { Get-MetaForDomain -RunId $runId } else { Get-MetaForDomain -DataPath $d.DataPath -Domain $d.Domain }
         $counts = @{
             high   = @($findings | Where-Object { $_.Severity -eq 'high' }).Count
             medium = @($findings | Where-Object { $_.Severity -eq 'medium' }).Count
@@ -197,25 +217,37 @@ function New-AuditHtmlReport {
         $grand.low += $counts.low
 
         # ---- baseline ----
+        # PreviousRunId (SQL) takes precedence over BaselinePath (the old
+        # "previous dated folder on disk" scheme, kept as the fallback for
+        # a domain whose database load failed - see run-remote.ps1).
         $diff = $null
         $baseCounts = $null
         $baseLabel = ''
+        $prevRunId = $(if ($d.PSObject.Properties.Name -contains 'PreviousRunId') { $d.PreviousRunId } else { $null })
         $basePath = $null
         if ($d.PSObject.Properties.Name -contains 'BaselinePath') { $basePath = $d.BaselinePath }
 
-        if ($basePath -and (Test-Path $basePath)) {
+        $baseFindings = $null
+        $baseSource = $null
+        if ($prevRunId) {
+            $baseFindings = Get-FindingsForDomain -RunId $prevRunId
+            $baseSource = "run $prevRunId"
+        }
+        elseif ($basePath -and (Test-Path $basePath)) {
             $baseFindings = Get-FindingsForDomain -DataPath $basePath -Domain $d.Domain
-            if (@($baseFindings).Count -or @($findings).Count) {
-                $diff = Compare-FindingSets -Current $findings -Baseline $baseFindings
-                $baseCounts = @{
-                    high   = @($baseFindings | Where-Object { $_.Severity -eq 'high' }).Count
-                    medium = @($baseFindings | Where-Object { $_.Severity -eq 'medium' }).Count
-                    low    = @($baseFindings | Where-Object { $_.Severity -eq 'low' }).Count
-                }
-                $grand.new += @($diff.New).Count
-                $grand.resolved += @($diff.Resolved).Count
-                $baseLabel = Split-Path $basePath -Leaf
+            $baseSource = Split-Path $basePath -Leaf
+        }
+
+        if ($baseSource -and (@($baseFindings).Count -or @($findings).Count)) {
+            $diff = Compare-FindingSets -Current $findings -Baseline $baseFindings
+            $baseCounts = @{
+                high   = @($baseFindings | Where-Object { $_.Severity -eq 'high' }).Count
+                medium = @($baseFindings | Where-Object { $_.Severity -eq 'medium' }).Count
+                low    = @($baseFindings | Where-Object { $_.Severity -eq 'low' }).Count
             }
+            $grand.new += @($diff.New).Count
+            $grand.resolved += @($diff.Resolved).Count
+            $baseLabel = $baseSource
         }
 
         [PSCustomObject]@{
