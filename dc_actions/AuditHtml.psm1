@@ -70,7 +70,11 @@ function Get-FindingsForDomain {
     param([int]$RunId, [string]$DataPath, [string]$Domain)
 
     if ($RunId) {
-        try { return , @(Get-FindingsFromDb -RunId $RunId) }
+        # Get-FindingsFromDb already returns a comma-protected array; wrapping
+        # it again here (`return , @(...)`) nests it into a 1-element array
+        # whose single element is the real array, which made every severity
+        # filter downstream match "1 item" instead of the real count.
+        try { return Get-FindingsFromDb -RunId $RunId }
         catch { Write-Warning "Could not read findings for RunId $RunId from SQL: $($_.Exception.Message)"; return , @() }
     }
 

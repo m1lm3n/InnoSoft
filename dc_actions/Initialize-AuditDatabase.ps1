@@ -14,22 +14,16 @@
         2. During setup, or afterwards via SSMS, enable
            "SQL Server and Windows Authentication mode" and restart the
            SQL Server service.
-        3. Create the database and a dedicated, least-privilege login:
+        3. Create the database and a dedicated, least-privilege login by
+           running, as a sysadmin:
 
-               CREATE DATABASE AdAudit;
-               GO
-               CREATE LOGIN ad_audit_svc WITH PASSWORD = '<a strong password>';
-               GO
-               USE AdAudit;
-               CREATE USER ad_audit_svc FOR LOGIN ad_audit_svc;
-               ALTER ROLE db_datareader ADD MEMBER ad_audit_svc;
-               ALTER ROLE db_datawriter ADD MEMBER ad_audit_svc;
-               ALTER ROLE db_ddladmin   ADD MEMBER ad_audit_svc;
-               GO
+               .\New-AuditDatabaseLogin.ps1
 
-           db_ddladmin is only needed so this script's own idempotent
-           CREATE TABLE statements can run; it is not sysadmin, and the
-           login has no access outside the AdAudit database.
+           It creates the AdAudit database, the ad_audit_svc login, and
+           grants it db_datareader/db_datawriter/db_ddladmin on that one
+           database only - not sysadmin, no access anywhere else. See that
+           script's header for options (custom login name, resetting the
+           password, connecting as a SQL login instead of Windows auth).
 
     After that, from this folder:
 

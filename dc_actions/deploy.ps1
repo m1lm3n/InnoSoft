@@ -41,8 +41,8 @@
         Audit*.psm1, targets.psd1,      output capture, HTML rendering, the
         db.psd1                         target table and the database
                                          connection settings are local concerns
-        Initialize-AuditDatabase.ps1     sets up the SQL Server database on
-                                         the workstation/server itself, never
+        Initialize-AuditDatabase.ps1,    set up the SQL Server database on
+        New-AuditDatabaseLogin.ps1       the workstation/server itself, never
                                          run against a controller
 
     That distinction matters: a module dropped on a controller and imported
@@ -74,6 +74,7 @@ param(
         'deploy.ps1',                       # deployment is driven from here, not from a DC
         'run-remote.ps1',                   # same
         'Initialize-AuditDatabase.ps1',      # sets up SQL locally, never run on a DC
+        'New-AuditDatabaseLogin.ps1',        # same, DBA-only provisioning step
         'Audit*.psm1',                       # capture, HTML, target and DB modules are local
         'targets.psd1',                      # the target table is local too
         'db.psd1'                            # database connection settings are local too
