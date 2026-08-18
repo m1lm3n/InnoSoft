@@ -232,13 +232,13 @@ try {
         catch { }
 
         [PSCustomObject]@{
-            Name          = $info.Server
-            Site          = $info.Site
-            DnsHostName   = $srv
-            IsGlobalCatalog = (($opts -band 1) -ne 0)
-            IsRodc        = $isRodc
-            OperatingSystem = $osName
-            LastLogon     = if ($lastLogon) { $lastLogon.ToString('yyyy-MM-dd HH:mm') } else { $null }
+            Name              = $info.Server
+            Site              = $info.Site
+            DnsHostName       = $srv
+            IsGlobalCatalog   = (($opts -band 1) -ne 0)
+            IsRodc            = $isRodc
+            OperatingSystem   = $osName
+            LastLogon         = if ($lastLogon) { $lastLogon.ToString('yyyy-MM-dd HH:mm') } else { $null }
             DistinguishedName = $dn
         }
     }
@@ -256,10 +256,10 @@ Write-Step "[2/9] FSMO roles"
 $fsmo = @()
 try {
     $roleMap = @(
-        @{ Role = 'Schema Master';        Dn = $schemaDn }
+        @{ Role = 'Schema Master'; Dn = $schemaDn }
         @{ Role = 'Domain Naming Master'; Dn = "CN=Partitions,$configDn" }
-        @{ Role = 'PDC Emulator';         Dn = $baseDn }
-        @{ Role = 'RID Master';           Dn = "CN=RID Manager`$,CN=System,$baseDn" }
+        @{ Role = 'PDC Emulator'; Dn = $baseDn }
+        @{ Role = 'RID Master'; Dn = "CN=RID Manager`$,CN=System,$baseDn" }
         @{ Role = 'Infrastructure Master'; Dn = "CN=Infrastructure,$baseDn" }
     )
     $fsmo = foreach ($m in $roleMap) {
@@ -420,15 +420,15 @@ Write-Step "[6/9] Privileged access"
 $privileged = @()
 try {
     $groupSpec = @(
-        @{ Name = 'Domain Admins';               Sid = "$domSid-512" }
-        @{ Name = 'Enterprise Admins';           Sid = "$domSid-519" }
-        @{ Name = 'Schema Admins';               Sid = "$domSid-518" }
+        @{ Name = 'Domain Admins'; Sid = "$domSid-512" }
+        @{ Name = 'Enterprise Admins'; Sid = "$domSid-519" }
+        @{ Name = 'Schema Admins'; Sid = "$domSid-518" }
         @{ Name = 'Group Policy Creator Owners'; Sid = "$domSid-520" }
-        @{ Name = 'Administrators';              Sid = 'S-1-5-32-544' }
-        @{ Name = 'Account Operators';           Sid = 'S-1-5-32-548' }
-        @{ Name = 'Server Operators';            Sid = 'S-1-5-32-549' }
-        @{ Name = 'Backup Operators';            Sid = 'S-1-5-32-551' }
-        @{ Name = 'Print Operators';             Sid = 'S-1-5-32-550' }
+        @{ Name = 'Administrators'; Sid = 'S-1-5-32-544' }
+        @{ Name = 'Account Operators'; Sid = 'S-1-5-32-548' }
+        @{ Name = 'Server Operators'; Sid = 'S-1-5-32-549' }
+        @{ Name = 'Backup Operators'; Sid = 'S-1-5-32-551' }
+        @{ Name = 'Print Operators'; Sid = 'S-1-5-32-550' }
     )
 
     foreach ($g in $groupSpec) {
@@ -450,17 +450,17 @@ try {
             $pwdSet = ConvertFrom-FileTimeSafe (Get-Prop $m 'pwdlastset')
             $lastOn = ConvertFrom-FileTimeSafe (Get-Prop $m 'lastlogontimestamp')
             $privileged += [PSCustomObject]@{
-                Group            = $g.Name
-                Member           = Get-Prop $m 'samaccountname'
-                Class            = @($m.Properties['objectclass'])[-1]
-                Enabled          = (($uac -band 2) -eq 0)
+                Group                = $g.Name
+                Member               = Get-Prop $m 'samaccountname'
+                Class                = @($m.Properties['objectclass'])[-1]
+                Enabled              = (($uac -band 2) -eq 0)
                 PasswordNeverExpires = (($uac -band 65536) -ne 0)
-                AdminCount       = Get-Prop $m 'admincount'
-                PasswordLastSet  = if ($pwdSet) { $pwdSet.ToString('yyyy-MM-dd') } else { $null }
-                PasswordAgeDays  = if ($pwdSet) { [int]((Get-Date) - $pwdSet).TotalDays } else { $null }
-                LastLogon        = if ($lastOn) { $lastOn.ToString('yyyy-MM-dd') } else { $null }
-                LastLogonDaysAgo = if ($lastOn) { [int]((Get-Date) - $lastOn).TotalDays } else { $null }
-                DistinguishedName = Get-Prop $m 'distinguishedname'
+                AdminCount           = Get-Prop $m 'admincount'
+                PasswordLastSet      = if ($pwdSet) { $pwdSet.ToString('yyyy-MM-dd') } else { $null }
+                PasswordAgeDays      = if ($pwdSet) { [int]((Get-Date) - $pwdSet).TotalDays } else { $null }
+                LastLogon            = if ($lastOn) { $lastOn.ToString('yyyy-MM-dd') } else { $null }
+                LastLogonDaysAgo     = if ($lastOn) { [int]((Get-Date) - $lastOn).TotalDays } else { $null }
+                DistinguishedName    = Get-Prop $m 'distinguishedname'
             }
         }
     }
@@ -512,27 +512,27 @@ try {
     # DirectorySearcher returns Int64 for these, unlike a bound [ADSI] object
     $domRes = Search-Directory -Base $baseDn -Filter '(objectClass=domainDNS)' -Scope 'Base' `
         -Properties 'maxpwdage', 'minpwdage', 'lockoutduration', 'minpwdlength',
-                    'pwdhistorylength', 'lockoutthreshold', 'msds-behavior-version'
+    'pwdhistorylength', 'lockoutthreshold', 'msds-behavior-version'
     $dr = $domRes[0]
 
     $maxPwdAge = ConvertFrom-AdInterval (Get-Prop $dr 'maxpwdage')
     $minPwdAge = ConvertFrom-AdInterval (Get-Prop $dr 'minpwdage')
-    $lockDur   = ConvertFrom-AdInterval (Get-Prop $dr 'lockoutduration')
+    $lockDur = ConvertFrom-AdInterval (Get-Prop $dr 'lockoutduration')
 
     $domainInfo = [PSCustomObject]@{
-        Domain              = $Domain
-        DomainSid           = $domSid
-        DomainFunctionLevel = Get-Prop $dr 'msds-behavior-version'
-        ForestFunctionLevel = $forestLevel
-        RecycleBinEnabled   = $recycleBin
-        TombstoneLifetime   = $tombstone
-        MaxPasswordAgeDays  = if ($maxPwdAge) { [int]$maxPwdAge.TotalDays } else { 'never' }
-        MinPasswordAgeDays  = if ($minPwdAge) { [int]$minPwdAge.TotalDays } else { 0 }
-        MinPasswordLength   = Get-Prop $dr 'minpwdlength'
-        PasswordHistory     = Get-Prop $dr 'pwdhistorylength'
-        LockoutThreshold    = Get-Prop $dr 'lockoutthreshold'
-        LockoutDurationMin  = if ($lockDur) { [int]$lockDur.TotalMinutes } else { 0 }
-        KrbtgtPasswordSet   = if ($krbtgtPwd) { $krbtgtPwd.ToString('yyyy-MM-dd') } else { $null }
+        Domain                = $Domain
+        DomainSid             = $domSid
+        DomainFunctionLevel   = Get-Prop $dr 'msds-behavior-version'
+        ForestFunctionLevel   = $forestLevel
+        RecycleBinEnabled     = $recycleBin
+        TombstoneLifetime     = $tombstone
+        MaxPasswordAgeDays    = if ($maxPwdAge) { [int]$maxPwdAge.TotalDays } else { 'never' }
+        MinPasswordAgeDays    = if ($minPwdAge) { [int]$minPwdAge.TotalDays } else { 0 }
+        MinPasswordLength     = Get-Prop $dr 'minpwdlength'
+        PasswordHistory       = Get-Prop $dr 'pwdhistorylength'
+        LockoutThreshold      = Get-Prop $dr 'lockoutthreshold'
+        LockoutDurationMin    = if ($lockDur) { [int]$lockDur.TotalMinutes } else { 0 }
+        KrbtgtPasswordSet     = if ($krbtgtPwd) { $krbtgtPwd.ToString('yyyy-MM-dd') } else { $null }
         KrbtgtPasswordAgeDays = if ($krbtgtPwd) { [int]((Get-Date) - $krbtgtPwd).TotalDays } else { $null }
     }
     [void](Out-Table $domainInfo 'domaininfo')
@@ -550,15 +550,15 @@ $delegation = New-Object System.Collections.Generic.List[object]
 try {
     # userAccountControl bits that matter here
     $UAC_TRUSTED_FOR_DELEGATION = 0x80000      # unconstrained
-    $UAC_TRUSTED_TO_AUTH        = 0x1000000    # protocol transition (S4U2Self)
-    $UAC_NOT_DELEGATED          = 0x100000     # "sensitive, cannot be delegated"
-    $UAC_SERVER_TRUST           = 0x2000       # domain controller
+    $UAC_TRUSTED_TO_AUTH = 0x1000000    # protocol transition (S4U2Self)
+    $UAC_NOT_DELEGATED = 0x100000     # "sensitive, cannot be delegated"
+    $UAC_SERVER_TRUST = 0x2000       # domain controller
 
     $delRes = Search-Directory -Base $baseDn `
         -Filter '(|(userAccountControl:1.2.840.113556.1.4.803:=524288)(msDS-AllowedToDelegateTo=*)(userAccountControl:1.2.840.113556.1.4.803:=16777216)(msDS-AllowedToActOnBehalfOfOtherIdentity=*))' `
         -Properties 'samaccountname', 'objectclass', 'useraccountcontrol', 'distinguishedname',
-                    'msds-allowedtodelegateto', 'msds-allowedtoactonbehalfofotheridentity',
-                    'serviceprincipalname', 'pwdlastset'
+    'msds-allowedtodelegateto', 'msds-allowedtoactonbehalfofotheridentity',
+    'serviceprincipalname', 'pwdlastset'
 
     foreach ($r in $delRes) {
         $uac = [int](Get-Prop $r 'useraccountcontrol')
@@ -601,17 +601,17 @@ try {
         catch { }
 
         $delegation.Add([PSCustomObject]@{
-            Name          = Get-Prop $r 'samaccountname'
-            Class         = @($r.Properties['objectclass'])[-1]
-            IsDomainController = $isDc
-            DelegationType = ($type -join ', ')
-            AllowedTo     = ($allowedTo -join '; ')
-            RbcdAllowedFrom = $rbcdWho
-            Spn           = (@($r.Properties['serviceprincipalname']) -join '; ')
-            Sensitive     = (($uac -band $UAC_NOT_DELEGATED) -ne 0)
-            Enabled       = (($uac -band 2) -eq 0)
-            DistinguishedName = Get-Prop $r 'distinguishedname'
-        })
+                Name               = Get-Prop $r 'samaccountname'
+                Class              = @($r.Properties['objectclass'])[-1]
+                IsDomainController = $isDc
+                DelegationType     = ($type -join ', ')
+                AllowedTo          = ($allowedTo -join '; ')
+                RbcdAllowedFrom    = $rbcdWho
+                Spn                = (@($r.Properties['serviceprincipalname']) -join '; ')
+                Sensitive          = (($uac -band $UAC_NOT_DELEGATED) -ne 0)
+                Enabled            = (($uac -band 2) -eq 0)
+                DistinguishedName  = Get-Prop $r 'distinguishedname'
+            })
     }
 
     [void](Out-Table $delegation 'delegation')
@@ -630,8 +630,8 @@ Write-Step "[9/9] Service accounts and SPNs"
 $spnAccounts = New-Object System.Collections.Generic.List[object]
 try {
     $UAC_DONT_REQ_PREAUTH = 0x400000   # AS-REP roastable
-    $UAC_REVERSIBLE       = 0x80       # password stored reversibly
-    $UAC_DONT_EXPIRE      = 0x10000
+    $UAC_REVERSIBLE = 0x80       # password stored reversibly
+    $UAC_DONT_EXPIRE = 0x10000
 
     # user objects only: computer SPNs are normal and not roastable in practice
     # krbtgt and the RODC krbtgt_* clones carry a system SPN by design and
@@ -639,8 +639,8 @@ try {
     $spnRes = Search-Directory -Base $baseDn `
         -Filter '(&(objectCategory=person)(objectClass=user)(!(samAccountName=krbtgt))(!(samAccountName=krbtgt_*))(|(servicePrincipalName=*)(userAccountControl:1.2.840.113556.1.4.803:=4194304)(userAccountControl:1.2.840.113556.1.4.803:=128)))' `
         -Properties 'samaccountname', 'useraccountcontrol', 'serviceprincipalname', 'pwdlastset',
-                    'lastlogontimestamp', 'admincount', 'msds-supportedencryptiontypes',
-                    'distinguishedname', 'description', 'memberof'
+    'lastlogontimestamp', 'admincount', 'msds-supportedencryptiontypes',
+    'distinguishedname', 'description', 'memberof'
 
     foreach ($r in $spnRes) {
         $uac = [int](Get-Prop $r 'useraccountcontrol')
@@ -662,22 +662,22 @@ try {
         $spns = @($r.Properties['serviceprincipalname'])
 
         $spnAccounts.Add([PSCustomObject]@{
-            Name            = Get-Prop $r 'samaccountname'
-            Description     = Get-Prop $r 'description'
-            SpnCount        = $spns.Count
-            Spn             = ($spns -join '; ')
-            Enabled         = (($uac -band 2) -eq 0)
-            PasswordNeverExpires = (($uac -band $UAC_DONT_EXPIRE) -ne 0)
-            NoPreauth       = (($uac -band $UAC_DONT_REQ_PREAUTH) -ne 0)
-            ReversiblePassword = (($uac -band $UAC_REVERSIBLE) -ne 0)
-            AdminCount      = Get-Prop $r 'admincount'
-            EncryptionTypes = if ($encNames) { $encNames -join ',' } else { 'default (RC4 allowed)' }
-            PasswordLastSet = if ($pwdSet) { $pwdSet.ToString('yyyy-MM-dd') } else { $null }
-            PasswordAgeDays = if ($pwdSet) { [int]((Get-Date) - $pwdSet).TotalDays } else { $null }
-            LastLogonDaysAgo = if ($lastOn) { [int]((Get-Date) - $lastOn).TotalDays } else { $null }
-            MemberOf        = (@($r.Properties['memberof']) | ForEach-Object { ($_ -split ',')[0] -replace '^CN=', '' }) -join '; '
-            DistinguishedName = Get-Prop $r 'distinguishedname'
-        })
+                Name                 = Get-Prop $r 'samaccountname'
+                Description          = Get-Prop $r 'description'
+                SpnCount             = $spns.Count
+                Spn                  = ($spns -join '; ')
+                Enabled              = (($uac -band 2) -eq 0)
+                PasswordNeverExpires = (($uac -band $UAC_DONT_EXPIRE) -ne 0)
+                NoPreauth            = (($uac -band $UAC_DONT_REQ_PREAUTH) -ne 0)
+                ReversiblePassword   = (($uac -band $UAC_REVERSIBLE) -ne 0)
+                AdminCount           = Get-Prop $r 'admincount'
+                EncryptionTypes      = if ($encNames) { $encNames -join ',' } else { 'default (RC4 allowed)' }
+                PasswordLastSet      = if ($pwdSet) { $pwdSet.ToString('yyyy-MM-dd') } else { $null }
+                PasswordAgeDays      = if ($pwdSet) { [int]((Get-Date) - $pwdSet).TotalDays } else { $null }
+                LastLogonDaysAgo     = if ($lastOn) { [int]((Get-Date) - $lastOn).TotalDays } else { $null }
+                MemberOf             = (@($r.Properties['memberof']) | ForEach-Object { ($_ -split ',')[0] -replace '^CN=', '' }) -join '; '
+                DistinguishedName    = Get-Prop $r 'distinguishedname'
+            })
     }
 
     [void](Out-Table $spnAccounts 'spn')
@@ -698,22 +698,22 @@ $finishedAt = Get-Date
 
 $metaFields = [ordered]@{}
 $metaSpec = @(
-    @{ Name = 'Domain';       Get = { [string]$Domain } }
-    @{ Name = 'Server';       Get = { [string]$Server } }
-    @{ Name = 'BaseDn';       Get = { [string]$baseDn } }
-    @{ Name = 'DomainSid';    Get = { [string]$domSid } }
-    @{ Name = 'CollectedAt';  Get = { $startedAt.ToString('yyyy-MM-dd HH:mm:ss') } }
-    @{ Name = 'FinishedAt';   Get = { $finishedAt.ToString('yyyy-MM-dd HH:mm:ss') } }
-    @{ Name = 'ElapsedSec';   Get = { [double][math]::Round($sw.Elapsed.TotalSeconds, 1) } }
-    @{ Name = 'CollectedBy';  Get = { [string]("$env:USERNAME on $env:COMPUTERNAME") } }
-    @{ Name = 'DcCount';      Get = { [int]@($dcs).Count } }
-    @{ Name = 'SiteCount';    Get = { [int]@($sites).Count } }
-    @{ Name = 'SubnetCount';  Get = { [int]@($subnets).Count } }
-    @{ Name = 'ReplLinks';    Get = { [int]@($repl).Count } }
-    @{ Name = 'PrivEntries';  Get = { [int]@($privileged).Count } }
+    @{ Name = 'Domain'; Get = { [string]$Domain } }
+    @{ Name = 'Server'; Get = { [string]$Server } }
+    @{ Name = 'BaseDn'; Get = { [string]$baseDn } }
+    @{ Name = 'DomainSid'; Get = { [string]$domSid } }
+    @{ Name = 'CollectedAt'; Get = { $startedAt.ToString('yyyy-MM-dd HH:mm:ss') } }
+    @{ Name = 'FinishedAt'; Get = { $finishedAt.ToString('yyyy-MM-dd HH:mm:ss') } }
+    @{ Name = 'ElapsedSec'; Get = { [double][math]::Round($sw.Elapsed.TotalSeconds, 1) } }
+    @{ Name = 'CollectedBy'; Get = { [string]("$env:USERNAME on $env:COMPUTERNAME") } }
+    @{ Name = 'DcCount'; Get = { [int]@($dcs).Count } }
+    @{ Name = 'SiteCount'; Get = { [int]@($sites).Count } }
+    @{ Name = 'SubnetCount'; Get = { [int]@($subnets).Count } }
+    @{ Name = 'ReplLinks'; Get = { [int]@($repl).Count } }
+    @{ Name = 'PrivEntries'; Get = { [int]@($privileged).Count } }
     @{ Name = 'DelegationObjects'; Get = { [int]$delegation.Count } }
-    @{ Name = 'SpnAccounts';  Get = { [int]$spnAccounts.Count } }
-    @{ Name = 'RepadminUsed'; Get = { [bool]$repadmin } }
+    @{ Name = 'SpnAccounts'; Get = { [int]$spnAccounts.Count } }
+    @{ Name = 'RepadminUsed'; Get = { $null -ne $repadmin } }
 )
 foreach ($f in $metaSpec) {
     try { $metaFields[$f.Name] = & $f.Get }
