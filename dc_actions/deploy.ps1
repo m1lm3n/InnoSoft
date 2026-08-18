@@ -239,9 +239,11 @@ foreach ($dom in $selected) {
 
 $hostsFor = @{}
 foreach ($dom in $selected) {
-    $list = @($Targets[$dom].Server)
-    if ($IncludeExtra) { $list += @($Targets[$dom].Extra) }
-    $hostsFor[$dom] = @($list | Where-Object { $_ } | Select-Object -Unique)
+    # Not $list: variable names are case insensitive, so it would collide
+    # with the [switch]$List parameter and fail the type constraint.
+    $hostList = @($Targets[$dom].Server)
+    if ($IncludeExtra) { $hostList += @($Targets[$dom].Extra) }
+    $hostsFor[$dom] = @($hostList | Where-Object { $_ } | Select-Object -Unique)
 }
 
 # ---------------------------------------------------------------
