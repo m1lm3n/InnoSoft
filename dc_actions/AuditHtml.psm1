@@ -88,6 +88,44 @@ function Get-FindingsForDomain {
     return , @($rows.ToArray())
 }
 
+function Compare-FindingSets {
+    <#
+        Compares two findings sets and returns what appeared, what went
+        away and what stayed. Identity is source plus area plus item: the
+        detail text often carries a count that moves on its own and would
+        otherwise make every row look new.
+    #>
+    param($Current, $Baseline)
+
+    function Get-Key { param($f) return "$($f.Source)|$($f.Area)|$($f.Item)" }
+
+    $baseKeys = @{}
+    foreach ($f in @($Baseline)) { $baseKeys[(Get-Key $f)] = $f }
+
+    $curKeys = @{}
+    foreach ($f in @($Current)) { $curKeys[(Get-Key $f)] = $f }
+
+    $new = @()
+    $same = @()
+    foreach ($f in @($Current)) {
+        $k = Get-Key $f
+        if ($baseKeys.ContainsKey($k)) { $same += $f } else { $new += $f }
+    }
+
+    $gone = @()
+    foreach ($f in @($Baseline)) {
+        $k = Get-Key $f
+        if (-not $curKeys.ContainsKey($k)) { $gone += $f }
+    }
+
+    return [PSCustomObject]@{
+        New      = @($new)
+        Resolved = @($gone)
+        Same     = @($same)
+        NewKeys  = @($new | ForEach-Object { Get-Key $_ })
+    }
+}
+
 function Get-MetaForDomain {
     param([string]$DataPath, [string]$Domain)
 
@@ -145,7 +183,7 @@ function New-AuditHtmlReport {
     $domains = @($Report)
 
     # ---------- totals ----------
-    $grand = @{ high = 0; medium = 0; low = 0 }
+    $grand = @{ high = 0; medium = 0; low = 0; new = 0; resolved = 0 }
     $prepared = foreach ($d in $domains) {
         $findings = Get-FindingsForDomain -DataPath $d.DataPath -Domain $d.Domain
         $meta = Get-MetaForDomain -DataPath $d.DataPath -Domain $d.Domain
@@ -158,13 +196,38 @@ function New-AuditHtmlReport {
         $grand.medium += $counts.medium
         $grand.low += $counts.low
 
+        # ---- baseline ----
+        $diff = $null
+        $baseCounts = $null
+        $baseLabel = ''
+        $basePath = $null
+        if ($d.PSObject.Properties.Name -contains 'BaselinePath') { $basePath = $d.BaselinePath }
+
+        if ($basePath -and (Test-Path $basePath)) {
+            $baseFindings = Get-FindingsForDomain -DataPath $basePath -Domain $d.Domain
+            if (@($baseFindings).Count -or @($findings).Count) {
+                $diff = Compare-FindingSets -Current $findings -Baseline $baseFindings
+                $baseCounts = @{
+                    high   = @($baseFindings | Where-Object { $_.Severity -eq 'high' }).Count
+                    medium = @($baseFindings | Where-Object { $_.Severity -eq 'medium' }).Count
+                    low    = @($baseFindings | Where-Object { $_.Severity -eq 'low' }).Count
+                }
+                $grand.new += @($diff.New).Count
+                $grand.resolved += @($diff.Resolved).Count
+                $baseLabel = Split-Path $basePath -Leaf
+            }
+        }
+
         [PSCustomObject]@{
-            Domain   = $d.Domain
-            DataPath = $d.DataPath
-            Sections = $d.Sections
-            Findings = $findings
-            Meta     = $meta
-            Counts   = $counts
+            Domain     = $d.Domain
+            DataPath   = $d.DataPath
+            Sections   = $d.Sections
+            Findings   = $findings
+            Meta       = $meta
+            Counts     = $counts
+            Diff       = $diff
+            BaseCounts = $baseCounts
+            BaseLabel  = $baseLabel
         }
     }
     $prepared = @($prepared)
@@ -185,11 +248,28 @@ function New-AuditHtmlReport {
         [void]$tabs.Append('<button class="tab' + $active + '" data-target="' + $id + '">' +
             (ConvertTo-HtmlText $d.Domain) + $badge + '</button>')
 
-        # --- cards ---
+        # --- cards, with a delta when a baseline exists ---
+        function Get-DeltaHtml {
+            param([int]$Now, $Before)
+            if ($null -eq $Before) { return '' }
+            $delta = $Now - [int]$Before
+            if ($delta -eq 0) { return '<span class="delta flat">no change</span>' }
+            # fewer findings is an improvement, so down is the good direction
+            $cls = if ($delta -lt 0) { 'good' } else { 'bad' }
+            $sign = if ($delta -gt 0) { '+' } else { '' }
+            return '<span class="delta ' + $cls + '">' + $sign + $delta + '</span>'
+        }
+
         $cards = '<div class="cards">'
-        $cards += '<div class="card sev-high"><div class="num">' + $d.Counts.high + '</div><div class="lbl">high</div></div>'
-        $cards += '<div class="card sev-medium"><div class="num">' + $d.Counts.medium + '</div><div class="lbl">medium</div></div>'
-        $cards += '<div class="card sev-low"><div class="num">' + $d.Counts.low + '</div><div class="lbl">low</div></div>'
+        $cards += '<div class="card sev-high"><div class="num">' + $d.Counts.high +
+        (Get-DeltaHtml -Now $d.Counts.high -Before $(if ($d.BaseCounts) { $d.BaseCounts.high } else { $null })) +
+        '</div><div class="lbl">high</div></div>'
+        $cards += '<div class="card sev-medium"><div class="num">' + $d.Counts.medium +
+        (Get-DeltaHtml -Now $d.Counts.medium -Before $(if ($d.BaseCounts) { $d.BaseCounts.medium } else { $null })) +
+        '</div><div class="lbl">medium</div></div>'
+        $cards += '<div class="card sev-low"><div class="num">' + $d.Counts.low +
+        (Get-DeltaHtml -Now $d.Counts.low -Before $(if ($d.BaseCounts) { $d.BaseCounts.low } else { $null })) +
+        '</div><div class="lbl">low</div></div>'
 
         $warnTotal = 0
         foreach ($sec in @($d.Sections)) {
@@ -222,16 +302,71 @@ function New-AuditHtmlReport {
         $metaLine = ''
         if ($metaBits.Count) { $metaLine = '<div class="meta">' + ($metaBits -join ' &middot; ') + '</div>' }
 
+        # --- what changed since the baseline ---
+        $changes = ''
+        if ($d.Diff) {
+            $newCount = @($d.Diff.New).Count
+            $goneCount = @($d.Diff.Resolved).Count
+
+            $verdict = 'nothing changed'
+            $verdictCls = 'flat'
+            if ($newCount -and $goneCount) { $verdict = "$newCount new, $goneCount resolved"; $verdictCls = 'mixed' }
+            elseif ($newCount) { $verdict = "$newCount new"; $verdictCls = 'bad' }
+            elseif ($goneCount) { $verdict = "$goneCount resolved"; $verdictCls = 'good' }
+
+            $changes = '<div class="changes ' + $verdictCls + '">'
+            $changes += '<div class="changes-head"><span class="changes-verdict">' + $verdict + '</span>'
+            $changes += '<span class="changes-base">since ' + (ConvertTo-HtmlText $d.BaseLabel) + '</span></div>'
+
+            if ($newCount -or $goneCount) {
+                $changes += '<div class="changes-body">'
+
+                if ($newCount) {
+                    $changes += '<div class="changes-col"><h4 class="new">appeared</h4><ul>'
+                    foreach ($f in (@($d.Diff.New) | Sort-Object @{ E = { @{ high = 0; medium = 1; low = 2 }["$($_.Severity)"] } } | Select-Object -First 15)) {
+                        $changes += '<li><span class="pill ' + $f.Severity + '">' + $f.Severity + '</span> ' +
+                        (ConvertTo-HtmlText $f.Item) + ' <em>' + (ConvertTo-HtmlText $f.Area) + '</em></li>'
+                    }
+                    if ($newCount -gt 15) { $changes += '<li class="more">... and ' + ($newCount - 15) + ' more</li>' }
+                    $changes += '</ul></div>'
+                }
+
+                if ($goneCount) {
+                    $changes += '<div class="changes-col"><h4 class="gone">resolved</h4><ul>'
+                    foreach ($f in (@($d.Diff.Resolved) | Select-Object -First 15)) {
+                        $changes += '<li><span class="pill ' + $f.Severity + '">' + $f.Severity + '</span> ' +
+                        (ConvertTo-HtmlText $f.Item) + ' <em>' + (ConvertTo-HtmlText $f.Area) + '</em></li>'
+                    }
+                    if ($goneCount -gt 15) { $changes += '<li class="more">... and ' + ($goneCount - 15) + ' more</li>' }
+                    $changes += '</ul></div>'
+                }
+
+                $changes += '</div>'
+            }
+            $changes += '</div>'
+        }
+        elseif ($d.BaseLabel) {
+            $changes = '<div class="changes flat"><div class="changes-head">' +
+            '<span class="changes-verdict">no comparable baseline</span></div></div>'
+        }
+
         # --- findings table ---
         $table = ''
         if (@($d.Findings).Count) {
             $order = @{ 'high' = 0; 'medium' = 1; 'low' = 2 }
             $sorted = $d.Findings | Sort-Object @{ E = { $order["$($_.Severity)"] } }, Source, Area, Item
 
+            $newKeys = @()
+            if ($d.Diff) { $newKeys = @($d.Diff.NewKeys) }
+
             $rows = New-Object System.Text.StringBuilder
             foreach ($f in $sorted) {
-                [void]$rows.Append('<tr data-sev="' + $f.Severity + '">')
-                [void]$rows.Append('<td><span class="pill ' + $f.Severity + '">' + $f.Severity + '</span></td>')
+                $key = "$($f.Source)|$($f.Area)|$($f.Item)"
+                $isNew = ($newKeys -contains $key)
+                $rowCls = if ($isNew) { ' class="is-new"' } else { '' }
+                [void]$rows.Append('<tr data-sev="' + $f.Severity + '" data-new="' + $(if ($isNew) { '1' } else { '0' }) + '"' + $rowCls + '>')
+                [void]$rows.Append('<td><span class="pill ' + $f.Severity + '">' + $f.Severity + '</span>' +
+                    $(if ($isNew) { '<span class="pill new">new</span>' } else { '' }) + '</td>')
                 [void]$rows.Append('<td class="src">' + (ConvertTo-HtmlText $f.Source) + '</td>')
                 [void]$rows.Append('<td>' + (ConvertTo-HtmlText $f.Area) + '</td>')
                 [void]$rows.Append('<td class="item">' + (ConvertTo-HtmlText $f.Item) + '</td>')
@@ -239,21 +374,21 @@ function New-AuditHtmlReport {
                 [void]$rows.Append('</tr>')
             }
 
-            $table = @'
-<div class="toolbar">
-  <input type="search" class="filter" placeholder="filter findings...">
-  <div class="chips">
-    <button class="chip on" data-sev="high">high</button>
-    <button class="chip on" data-sev="medium">medium</button>
-    <button class="chip" data-sev="low">low</button>
-  </div>
-  <span class="shown"></span>
-</div>
-<div class="tablewrap">
-<table class="findings">
-  <thead><tr><th>severity</th><th>source</th><th>area</th><th>item</th><th>detail</th></tr></thead>
-  <tbody>
-'@
+            $newChip = ''
+            if ($d.Diff -and @($d.Diff.New).Count) {
+                $newChip = '<button class="chip newonly" data-newonly="1">new only</button>'
+            }
+
+            $table = '<div class="toolbar">' +
+            '<input type="search" class="filter" placeholder="filter findings...">' +
+            '<div class="chips">' +
+            '<button class="chip on" data-sev="high">high</button>' +
+            '<button class="chip on" data-sev="medium">medium</button>' +
+            '<button class="chip" data-sev="low">low</button>' +
+            $newChip +
+            '</div><span class="shown"></span></div>' +
+            '<div class="tablewrap"><table class="findings">' +
+            '<thead><tr><th>severity</th><th>source</th><th>area</th><th>item</th><th>detail</th></tr></thead><tbody>'
             $table += $rows.ToString()
             $table += '</tbody></table></div>'
         }
@@ -301,7 +436,7 @@ function New-AuditHtmlReport {
         }
 
         [void]$panels.Append('<section class="panel' + $active + '" id="' + $id + '">' +
-            $metaLine + $cards + $table + $logs + '</section>')
+            $metaLine + $cards + $changes + $table + $logs + '</section>')
         $i++
     }
 
@@ -391,6 +526,37 @@ pre.term{margin:0;background:var(--term-bg);color:#c8ccd4;padding:16px 18px;over
 .secmsg.err{background:#fff5f5;color:#8f2d2d}
 .secmsg ul{margin:6px 0 0;padding-left:20px}
 .secmsg li{margin:2px 0;font-family:var(--font-mono);font-size:12px}
+
+/* baseline comparison */
+.delta{font-size:12px;font-weight:600;margin-left:8px;vertical-align:middle;
+  padding:1px 7px;border-radius:20px;letter-spacing:0}
+.delta.good{background:#e8f6ec;color:#1e7a3c}
+.delta.bad{background:#fdecec;color:var(--high)}
+.delta.flat{background:#f1f2f4;color:var(--ink-soft);font-weight:500}
+.total.sep{margin-left:10px;padding-left:16px;border-left:1px solid var(--line);gap:8px}
+.changes{background:var(--surface);border:1px solid var(--line);border-radius:10px;
+  margin-bottom:20px;overflow:hidden;border-left-width:3px}
+.changes.good{border-left-color:#3fa45f}
+.changes.bad{border-left-color:var(--high)}
+.changes.mixed{border-left-color:var(--medium)}
+.changes.flat{border-left-color:var(--line)}
+.changes-head{display:flex;align-items:baseline;gap:12px;padding:12px 18px}
+.changes-verdict{font-weight:600;font-size:14px}
+.changes-base{color:var(--ink-soft);font-size:12.5px;font-family:var(--font-mono)}
+.changes-body{display:flex;gap:0;border-top:1px solid var(--line);flex-wrap:wrap}
+.changes-col{flex:1;min-width:280px;padding:12px 18px 16px}
+.changes-col+.changes-col{border-left:1px solid var(--line)}
+.changes-col h4{margin:0 0 8px;font-size:11.5px;text-transform:uppercase;
+  letter-spacing:.06em;font-weight:600}
+.changes-col h4.new{color:var(--high)}
+.changes-col h4.gone{color:#1e7a3c}
+.changes-col ul{margin:0;padding:0;list-style:none}
+.changes-col li{padding:3px 0;font-size:13px;line-height:1.45}
+.changes-col li em{color:var(--ink-soft);font-style:normal;font-size:12px}
+.changes-col li.more{color:var(--ink-soft);font-style:italic;padding-top:6px}
+.pill.new{background:#eef2ff;color:#3a4fb8;margin-left:5px}
+tr.is-new td:first-child{box-shadow:inset 3px 0 0 var(--high)}
+.chip.newonly.on{background:#3a4fb8;border-color:#3a4fb8}
 @media print{
   .tabs,.toolbar{display:none}
   .panel{display:block!important;page-break-after:always}
@@ -427,12 +593,17 @@ pre.term{margin:0;background:var(--term-bg);color:#c8ccd4;padding:16px 18px;over
     function apply(){
       var q = (input && input.value ? input.value : '').toLowerCase();
       var allow = {};
-      chips.forEach(function(c){ allow[c.dataset.sev] = c.classList.contains('on'); });
+      var newOnly = false;
+      chips.forEach(function(c){
+        if (c.dataset.newonly) { newOnly = c.classList.contains('on'); }
+        else { allow[c.dataset.sev] = c.classList.contains('on'); }
+      });
       var n = 0;
       rows.forEach(function(r){
         var okSev = allow[r.dataset.sev];
         var okTxt = !q || r.textContent.toLowerCase().indexOf(q) !== -1;
-        var vis = okSev && okTxt;
+        var okNew = !newOnly || r.dataset.new === '1';
+        var vis = okSev && okTxt && okNew;
         r.style.display = vis ? '' : 'none';
         if (vis) { n++; }
       });
@@ -467,6 +638,12 @@ pre.term{margin:0;background:var(--term-bg);color:#c8ccd4;padding:16px 18px;over
     if ($grandWarn) {
         $totals += '<div class="total medium"><b>' + $grandWarn + '</b> warnings</div>'
     }
+    if ($grand.new -or $grand.resolved) {
+        $totals += '<div class="total sep">'
+        if ($grand.new) { $totals += '<span class="delta bad">+' + $grand.new + ' new</span>' }
+        if ($grand.resolved) { $totals += '<span class="delta good">-' + $grand.resolved + ' resolved</span>' }
+        $totals += '</div>'
+    }
     $totals += '</div>'
 
     $header = '<header><h1>' + (ConvertTo-HtmlText $Title) + '</h1>' +
@@ -492,6 +669,8 @@ pre.term{margin:0;background:var(--term-bg);color:#c8ccd4;padding:16px 18px;over
         Medium   = $grand.medium
         Low      = $grand.low
         Warnings = $grandWarn
+        New      = $grand.new
+        Resolved = $grand.resolved
         SizeKb   = [math]::Round((Get-Item $Path).Length / 1KB, 1)
     }
 }

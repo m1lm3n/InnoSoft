@@ -793,9 +793,10 @@ foreach ($dom in $selected) {
                         # nothing was captured, but the collection log is
                         # still worth putting in the report
                         $reportData.Add([PSCustomObject]@{
-                                Domain   = $dom
-                                DataPath = $localDir
-                                Sections = @()
+                                Domain       = $dom
+                                DataPath     = $localDir
+                                BaselinePath = $null
+                                Sections     = @()
                             })
                     }
                     else {
@@ -891,9 +892,10 @@ foreach ($dom in $selected) {
                         }
 
                         $reportData.Add([PSCustomObject]@{
-                                Domain   = $dom
-                                DataPath = $localDir
-                                Sections = @($sections.ToArray())
+                                Domain       = $dom
+                                DataPath     = $localDir
+                                BaselinePath = $(if ($prevDir) { $prevDir.FullName } else { $null })
+                                Sections     = @($sections.ToArray())
                             })
                     }
                 }
@@ -1000,6 +1002,10 @@ if (-not $NoReport -and $script:CanReport -and $reportData.Count) {
             $warnBit = ", $($rep.Warnings) warning(s)"
         }
         Write-Host ("  $($rep.Domains) domain(s), $($rep.High) high, $($rep.Medium) medium, $($rep.Low) low$warnBit, $($rep.SizeKb) KB") -ForegroundColor DarkGray
+        if ($rep.PSObject.Properties.Name -contains 'New' -and ($rep.New -or $rep.Resolved)) {
+            $moveColour = if ($rep.New -gt 0) { 'Yellow' } else { 'Green' }
+            Write-Host ("  since the previous run: $($rep.New) new, $($rep.Resolved) resolved") -ForegroundColor $moveColour
+        }
         if (-not $OpenReport) { Write-Host "  open with: ii '$($rep.Path)'" -ForegroundColor DarkGray }
     }
     catch { Write-Warning "Could not build the report: $($_.Exception.Message)" }

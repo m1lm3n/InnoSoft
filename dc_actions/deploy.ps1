@@ -518,4 +518,4 @@ if ($failed.Count) {
 Write-Host "All $($results.Count) target(s) up to date" -ForegroundColor Green
 Write-Host ""
 Write-Host "Next: .\run-remote.ps1 -all" -ForegroundColor DarkGray
-Write-Host ""пше
+Write-Host ""
