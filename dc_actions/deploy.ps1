@@ -293,8 +293,11 @@ foreach ($dom in $selected) {
         if ($cred) {
             try {
                 $driveName = 'dep' + [guid]::NewGuid().ToString('N').Substring(0, 6)
+                # -WhatIf:$false on purpose. Opening an authenticated session
+                # changes nothing on the controller, and without it a -WhatIf
+                # run cannot even test whether the share is reachable.
                 New-PSDrive -Name $driveName -PSProvider FileSystem -Root "\\$server\c$" `
-                    -Credential $cred -ErrorAction Stop | Out-Null
+                    -Credential $cred -ErrorAction Stop -WhatIf:$false | Out-Null
             }
             catch {
                 Write-Host "    authentication failed: $(($_.Exception.Message -split "`n")[0])" -ForegroundColor Red
@@ -312,12 +315,12 @@ foreach ($dom in $selected) {
         if (-not $shareOk -and $PromptOnDenied) {
             Write-Host "    access denied, asking for credentials" -ForegroundColor DarkYellow
             try {
-                if ($driveName) { Remove-PSDrive -Name $driveName -Force -ErrorAction SilentlyContinue }
+                if ($driveName) { Remove-PSDrive -Name $driveName -Force -ErrorAction SilentlyContinue -WhatIf:$false }
                 $cred = Resolve-DeployCredential -Dom $dom -Server $server -Interactive
                 if ($cred) {
                     $driveName = 'dep' + [guid]::NewGuid().ToString('N').Substring(0, 6)
                     New-PSDrive -Name $driveName -PSProvider FileSystem -Root "\\$server\c$" `
-                        -Credential $cred -ErrorAction Stop | Out-Null
+                        -Credential $cred -ErrorAction Stop -WhatIf:$false | Out-Null
                     $shareOk = Test-Path "\\$server\c$" -ErrorAction SilentlyContinue
                 }
             }
@@ -333,7 +336,7 @@ foreach ($dom in $selected) {
                 Write-Host "    no credential for this domain. Store one once:" -ForegroundColor DarkYellow
                 Write-Host "      .\run-remote.ps1 -domain $dom -setcredential" -ForegroundColor DarkYellow
             }
-            if ($driveName) { Remove-PSDrive -Name $driveName -Force -ErrorAction SilentlyContinue }
+            if ($driveName) { Remove-PSDrive -Name $driveName -Force -ErrorAction SilentlyContinue -WhatIf:$false }
             $results.Add([PSCustomObject]@{ Domain = $dom; Server = $server; Status = 'no access'; Detail = 'admin share unreachable' })
             continue
         }
@@ -405,10 +408,25 @@ foreach ($dom in $selected) {
             }
         }
         else {
+            # Show what a real run would ship, rather than nothing at all
+            try {
+                $preview = @(Get-ChildItem $Source -File |
+                    Where-Object {
+                        $name = $_.Name
+                        $match = $false
+                        foreach ($pat in $Include) { if ($name -like $pat) { $match = $true } }
+                        $skip = $false
+                        foreach ($ex in $Exclude) { if ($name -like $ex) { $skip = $true } }
+                        $match -and -not $skip
+                    })
+                Write-Host "    would consider $($preview.Count) file(s), copying those newer than the target" -ForegroundColor DarkGray
+            }
+            catch { }
             $status = 'skipped (whatif)'
+            $detail = 'dry run'
         }
 
-        if ($driveName) { Remove-PSDrive -Name $driveName -Force -ErrorAction SilentlyContinue }
+        if ($driveName) { Remove-PSDrive -Name $driveName -Force -ErrorAction SilentlyContinue -WhatIf:$false }
 
         $results.Add([PSCustomObject]@{ Domain = $dom; Server = $server; Status = $status; Detail = $detail })
     }
