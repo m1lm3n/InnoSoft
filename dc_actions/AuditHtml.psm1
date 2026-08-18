@@ -350,28 +350,66 @@ function New-AuditHtmlReport {
             '<span class="changes-verdict">no comparable baseline</span></div></div>'
         }
 
-        # --- findings table ---
+        # ---------------------------------------------------------------
+        # Findings, grouped into collapsed accordions by area.
+        #
+        # Six domains with several hundred findings between them is not
+        # something anyone reads as one long table. Everything starts shut;
+        # the header of each group carries enough to decide whether to open
+        # it. Filtering opens the groups that still have matches.
+        # ---------------------------------------------------------------
         $table = ''
         if (@($d.Findings).Count) {
-            $order = @{ 'high' = 0; 'medium' = 1; 'low' = 2 }
-            $sorted = $d.Findings | Sort-Object @{ E = { $order["$($_.Severity)"] } }, Source, Area, Item
+            $sevRank = @{ 'high' = 0; 'medium' = 1; 'low' = 2 }
 
             $newKeys = @()
             if ($d.Diff) { $newKeys = @($d.Diff.NewKeys) }
 
-            $rows = New-Object System.Text.StringBuilder
-            foreach ($f in $sorted) {
-                $key = "$($f.Source)|$($f.Area)|$($f.Item)"
-                $isNew = ($newKeys -contains $key)
-                $rowCls = if ($isNew) { ' class="is-new"' } else { '' }
-                [void]$rows.Append('<tr data-sev="' + $f.Severity + '" data-new="' + $(if ($isNew) { '1' } else { '0' }) + '"' + $rowCls + '>')
-                [void]$rows.Append('<td><span class="pill ' + $f.Severity + '">' + $f.Severity + '</span>' +
-                    $(if ($isNew) { '<span class="pill new">new</span>' } else { '' }) + '</td>')
-                [void]$rows.Append('<td class="src">' + (ConvertTo-HtmlText $f.Source) + '</td>')
-                [void]$rows.Append('<td>' + (ConvertTo-HtmlText $f.Area) + '</td>')
-                [void]$rows.Append('<td class="item">' + (ConvertTo-HtmlText $f.Item) + '</td>')
-                [void]$rows.Append('<td class="detail">' + (ConvertTo-HtmlText $f.Detail) + '</td>')
-                [void]$rows.Append('</tr>')
+            # areas ordered by worst severity first, then by size
+            $groups = $d.Findings | Group-Object Area | Sort-Object `
+            @{ E = { ($_.Group | ForEach-Object { $sevRank["$($_.Severity)"] } | Measure-Object -Minimum).Minimum } },
+            @{ E = { - $_.Count } },
+            Name
+
+            $acc = New-Object System.Text.StringBuilder
+
+            foreach ($g in $groups) {
+                $gHigh = @($g.Group | Where-Object { $_.Severity -eq 'high' }).Count
+                $gMed = @($g.Group | Where-Object { $_.Severity -eq 'medium' }).Count
+                $gLow = @($g.Group | Where-Object { $_.Severity -eq 'low' }).Count
+                $gNew = @($g.Group | Where-Object { $newKeys -contains "$($_.Source)|$($_.Area)|$($_.Item)" }).Count
+
+                $badges = ''
+                if ($gHigh) { $badges += '<span class="pill high">' + $gHigh + '</span>' }
+                if ($gMed) { $badges += '<span class="pill medium">' + $gMed + '</span>' }
+                if ($gLow) { $badges += '<span class="pill low">' + $gLow + '</span>' }
+                if ($gNew) { $badges += '<span class="pill new">' + $gNew + ' new</span>' }
+
+                [void]$acc.Append('<details class="area"><summary>')
+                [void]$acc.Append('<span class="area-name">' + (ConvertTo-HtmlText $g.Name) + '</span>')
+                [void]$acc.Append('<span class="area-badges">' + $badges + '</span>')
+                [void]$acc.Append('<span class="area-count">' + $g.Count + '</span>')
+                [void]$acc.Append('</summary>')
+
+                [void]$acc.Append('<table class="findings"><tbody>')
+
+                $ordered = $g.Group | Sort-Object @{ E = { $sevRank["$($_.Severity)"] } }, Source, Item
+                foreach ($f in $ordered) {
+                    $key = "$($f.Source)|$($f.Area)|$($f.Item)"
+                    $isNew = ($newKeys -contains $key)
+                    $rowCls = if ($isNew) { ' class="is-new"' } else { '' }
+
+                    [void]$acc.Append('<tr data-sev="' + $f.Severity + '" data-new="' +
+                        $(if ($isNew) { '1' } else { '0' }) + '"' + $rowCls + '>')
+                    [void]$acc.Append('<td class="c-sev"><span class="pill ' + $f.Severity + '">' + $f.Severity + '</span>' +
+                        $(if ($isNew) { '<span class="pill new">new</span>' } else { '' }) + '</td>')
+                    [void]$acc.Append('<td class="src">' + (ConvertTo-HtmlText $f.Source) + '</td>')
+                    [void]$acc.Append('<td class="item">' + (ConvertTo-HtmlText $f.Item) + '</td>')
+                    [void]$acc.Append('<td class="detail">' + (ConvertTo-HtmlText $f.Detail) + '</td>')
+                    [void]$acc.Append('</tr>')
+                }
+
+                [void]$acc.Append('</tbody></table></details>')
             }
 
             $newChip = ''
@@ -386,11 +424,13 @@ function New-AuditHtmlReport {
             '<button class="chip on" data-sev="medium">medium</button>' +
             '<button class="chip" data-sev="low">low</button>' +
             $newChip +
-            '</div><span class="shown"></span></div>' +
-            '<div class="tablewrap"><table class="findings">' +
-            '<thead><tr><th>severity</th><th>source</th><th>area</th><th>item</th><th>detail</th></tr></thead><tbody>'
-            $table += $rows.ToString()
-            $table += '</tbody></table></div>'
+            '</div>' +
+            '<div class="acc-ctl">' +
+            '<button class="linkbtn expand-all">expand all</button>' +
+            '<button class="linkbtn collapse-all">collapse all</button>' +
+            '</div>' +
+            '<span class="shown"></span></div>' +
+            '<div class="areas">' + $acc.ToString() + '</div>'
         }
         else {
             $table = '<div class="empty">no findings recorded</div>'
@@ -486,14 +526,31 @@ main{padding:22px 28px 60px;max-width:1500px}
   font-size:12.5px;padding:5px 12px;border-radius:20px;cursor:pointer;color:var(--ink-soft)}
 .chip.on{background:var(--ink);color:#fff;border-color:var(--ink)}
 .shown{color:var(--ink-soft);font-size:12.5px;margin-left:auto}
-.tablewrap{background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+/* findings grouped by area */
+.areas{display:flex;flex-direction:column;gap:8px}
+details.area{background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+details.area>summary{display:flex;align-items:center;gap:12px;padding:11px 16px;cursor:pointer;
+  list-style:none;user-select:none}
+details.area>summary::-webkit-details-marker{display:none}
+details.area>summary::before{content:"";flex:0 0 auto;border:solid var(--ink-soft);
+  border-width:0 1.5px 1.5px 0;padding:3px;transform:rotate(-45deg);transition:transform .15s}
+details.area[open]>summary::before{transform:rotate(45deg)}
+details.area>summary:hover{background:#f7f9fc}
+details.area[open]>summary{border-bottom:1px solid var(--line);background:#fafbfc}
+.area-name{font-weight:600;font-size:13.5px}
+.area-badges{display:flex;gap:4px;align-items:center}
+.area-count{margin-left:auto;font-size:12px;color:var(--ink-soft);font-family:var(--font-mono);
+  font-variant-numeric:tabular-nums}
+.acc-ctl{display:flex;gap:10px}
+.linkbtn{appearance:none;border:0;background:none;font:inherit;font-size:12.5px;
+  color:var(--accent);cursor:pointer;padding:0}
+.linkbtn:hover{text-decoration:underline}
+
 table.findings{width:100%;border-collapse:collapse}
-table.findings th{text-align:left;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;
-  color:var(--ink-soft);font-weight:600;padding:10px 14px;border-bottom:1px solid var(--line);
-  background:#fafbfc;position:sticky;top:0}
-table.findings td{padding:9px 14px;border-bottom:1px solid #f0f2f5;vertical-align:top}
+table.findings td{padding:8px 16px;border-bottom:1px solid #f0f2f5;vertical-align:top}
 table.findings tr:last-child td{border-bottom:0}
 table.findings tbody tr:hover{background:#f7f9fc}
+td.c-sev{white-space:nowrap;width:1%}
 .pill{display:inline-block;font-size:11px;font-weight:600;padding:2px 9px;border-radius:20px;
   text-transform:uppercase;letter-spacing:.04em}
 .pill.high{background:#fdecec;color:var(--high)}
@@ -561,6 +618,10 @@ tr.is-new td:first-child{box-shadow:inset 3px 0 0 var(--high)}
   .tabs,.toolbar{display:none}
   .panel{display:block!important;page-break-after:always}
   .logbox{page-break-inside:avoid}
+  details.area{page-break-inside:avoid}
+  details.area>summary::before{display:none}
+  /* paper has no toggles, so everything is shown */
+  details.area>table.findings{display:table!important}
 }
 '@
 
@@ -584,11 +645,24 @@ tr.is-new td:first-child{box-shadow:inset 3px 0 0 var(--high)}
   }
 
   document.querySelectorAll('.panel').forEach(function(panel){
-    var input = panel.querySelector('.filter');
-    var chips = panel.querySelectorAll('.chip');
-    var rows  = panel.querySelectorAll('table.findings tbody tr');
-    var shown = panel.querySelector('.shown');
+    var input  = panel.querySelector('.filter');
+    var chips  = panel.querySelectorAll('.chip');
+    var rows   = panel.querySelectorAll('.area table.findings tbody tr');
+    var areas  = panel.querySelectorAll('details.area');
+    var shown  = panel.querySelector('.shown');
+    var expand = panel.querySelector('.expand-all');
+    var close  = panel.querySelector('.collapse-all');
     if (!rows.length) { return; }
+
+    // remembers what the reader opened, so filtering does not fight them
+    var manual = {};
+    areas.forEach(function(a, i){
+      a.dataset.idx = i;
+      a.addEventListener('toggle', function(){
+        if (!filtering) { manual[i] = a.open; }
+      });
+    });
+    var filtering = false;
 
     function apply(){
       var q = (input && input.value ? input.value : '').toLowerCase();
@@ -598,22 +672,56 @@ tr.is-new td:first-child{box-shadow:inset 3px 0 0 var(--high)}
         if (c.dataset.newonly) { newOnly = c.classList.contains('on'); }
         else { allow[c.dataset.sev] = c.classList.contains('on'); }
       });
-      var n = 0;
-      rows.forEach(function(r){
-        var okSev = allow[r.dataset.sev];
-        var okTxt = !q || r.textContent.toLowerCase().indexOf(q) !== -1;
-        var okNew = !newOnly || r.dataset.new === '1';
-        var vis = okSev && okTxt && okNew;
-        r.style.display = vis ? '' : 'none';
-        if (vis) { n++; }
+
+      var narrowed = (q.length > 0) || newOnly;
+      var total = 0;
+
+      filtering = true;
+      areas.forEach(function(area){
+        var visible = 0;
+        area.querySelectorAll('tbody tr').forEach(function(r){
+          var okSev = allow[r.dataset.sev];
+          var okTxt = !q || r.textContent.toLowerCase().indexOf(q) !== -1;
+          var okNew = !newOnly || r.dataset.new === '1';
+          var vis = okSev && okTxt && okNew;
+          r.style.display = vis ? '' : 'none';
+          if (vis) { visible++; }
+        });
+
+        total += visible;
+
+        // an area with nothing left to show is taken off the page entirely
+        area.style.display = visible ? '' : 'none';
+
+        var badge = area.querySelector('.area-count');
+        if (badge) { badge.textContent = narrowed ? visible : area.querySelectorAll('tbody tr').length; }
+
+        // open what matches while narrowing, restore the reader's choice
+        // once the filter is cleared
+        if (narrowed) { area.open = visible > 0; }
+        else { area.open = !!manual[area.dataset.idx]; }
       });
-      if (shown) { shown.textContent = n + ' of ' + rows.length + ' shown'; }
+      filtering = false;
+
+      if (shown) { shown.textContent = total + ' of ' + rows.length + ' shown'; }
     }
 
     if (input) { input.addEventListener('input', apply); }
     chips.forEach(function(c){
       c.addEventListener('click', function(){ c.classList.toggle('on'); apply(); });
     });
+    if (expand) {
+      expand.addEventListener('click', function(){
+        areas.forEach(function(a){
+          if (a.style.display !== 'none') { a.open = true; manual[a.dataset.idx] = true; }
+        });
+      });
+    }
+    if (close) {
+      close.addEventListener('click', function(){
+        areas.forEach(function(a){ a.open = false; manual[a.dataset.idx] = false; });
+      });
+    }
     apply();
   });
 })();
