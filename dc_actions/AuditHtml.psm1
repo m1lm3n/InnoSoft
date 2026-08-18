@@ -75,12 +75,12 @@ function Get-FindingsForDomain {
         try {
             foreach ($r in (Import-Csv $full)) {
                 $rows.Add([PSCustomObject]@{
-                    Source   = $map[$file]
-                    Area     = $r.Area
-                    Severity = "$($r.Severity)".ToLower()
-                    Item     = $r.Item
-                    Detail   = $r.Detail
-                })
+                        Source   = $map[$file]
+                        Area     = $r.Area
+                        Severity = "$($r.Severity)".ToLower()
+                        Item     = $r.Item
+                        Detail   = $r.Detail
+                    })
             }
         }
         catch { }
@@ -197,7 +197,7 @@ function New-AuditHtmlReport {
         }
         if ($warnTotal) {
             $cards += '<div class="card sev-medium"><div class="num">' + $warnTotal +
-                '</div><div class="lbl">warnings</div></div>'
+            '</div><div class="lbl">warnings</div></div>'
         }
 
         foreach ($k in @('DcCount', 'GpoCount', 'ComputerCount', 'PrivEntries')) {
@@ -209,7 +209,7 @@ function New-AuditHtmlReport {
                     'PrivEntries' { 'priv. entries' }
                 }
                 $cards += '<div class="card plain"><div class="num">' + (ConvertTo-HtmlText $d.Meta[$k]) +
-                    '</div><div class="lbl">' + $label + '</div></div>'
+                '</div><div class="lbl">' + $label + '</div></div>'
             }
         }
         $cards += '</div>'
@@ -273,7 +273,7 @@ function New-AuditHtmlReport {
             }
             elseif ($warnCount) {
                 $tag = '<span class="sec-tag warn">' + $warnCount + ' warning' +
-                    $(if ($warnCount -gt 1) { 's' } else { '' }) + '</span>'
+                $(if ($warnCount -gt 1) { 's' } else { '' }) + '</span>'
             }
 
             $lineCount = @($sec.Lines).Count
@@ -449,8 +449,8 @@ pre.term{margin:0;background:var(--term-bg);color:#c8ccd4;padding:16px 18px;over
 '@
 
     $head = '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
-        '<meta name="viewport" content="width=device-width, initial-scale=1">' +
-        '<title>' + (ConvertTo-HtmlText $Title) + '</title><style>' + $css + '</style></head><body>'
+    '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+    '<title>' + (ConvertTo-HtmlText $Title) + '</title><style>' + $css + '</style></head><body>'
 
     $grandWarn = 0
     foreach ($d in $prepared) {
@@ -460,22 +460,22 @@ pre.term{margin:0;background:var(--term-bg);color:#c8ccd4;padding:16px 18px;over
     }
 
     $totals = '<div class="totals">' +
-        '<div class="total high"><b>' + $grand.high + '</b> high</div>' +
-        '<div class="total medium"><b>' + $grand.medium + '</b> medium</div>' +
-        '<div class="total"><b>' + $grand.low + '</b> low</div>' +
-        '<div class="total"><b>' + $prepared.Count + '</b> domains</div>'
+    '<div class="total high"><b>' + $grand.high + '</b> high</div>' +
+    '<div class="total medium"><b>' + $grand.medium + '</b> medium</div>' +
+    '<div class="total"><b>' + $grand.low + '</b> low</div>' +
+    '<div class="total"><b>' + $prepared.Count + '</b> domains</div>'
     if ($grandWarn) {
         $totals += '<div class="total medium"><b>' + $grandWarn + '</b> warnings</div>'
     }
     $totals += '</div>'
 
     $header = '<header><h1>' + (ConvertTo-HtmlText $Title) + '</h1>' +
-        '<div class="sub">generated ' + $generated.ToString('yyyy-MM-dd HH:mm') +
-        ' on ' + (ConvertTo-HtmlText $env:COMPUTERNAME) + '</div>' +
-        $totals + '<nav class="tabs">' + $tabs.ToString() + '</nav></header>'
+    '<div class="sub">generated ' + $generated.ToString('yyyy-MM-dd HH:mm') +
+    ' on ' + (ConvertTo-HtmlText $env:COMPUTERNAME) + '</div>' +
+    $totals + '<nav class="tabs">' + $tabs.ToString() + '</nav></header>'
 
     $html = $head + $header + '<main>' + $panels.ToString() + '</main>' +
-        '<script>' + $js + '</script></body></html>'
+    '<script>' + $js + '</script></body></html>'
 
     $dir = Split-Path $Path -Parent
     if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
