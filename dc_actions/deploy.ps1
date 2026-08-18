@@ -29,9 +29,21 @@
         .\deploy.ps1 -all -promptondenied
         .\deploy.ps1 -domain xxx.lo -credential (Get-Credential xxx\admin)
 
-    deploy.ps1 and run-remote.ps1 exclude themselves: they are useless on a
-    controller and their presence there suggests deployment can be driven
-    from the server.
+    What lands on a controller
+        Export-*.ps1     collectors, the only thing that must run there
+        Analyze-*.ps1    kept so a controller can be audited by hand
+        run-*.ps1        the three thin wrappers those collectors use
+        Fix-*.ps1        maintenance scripts
+
+    What deliberately does not
+        deploy.ps1, run-remote.ps1   deployment and orchestration are driven
+                                     from the workstation
+        Audit*.psm1, targets.psd1    output capture, HTML rendering and the
+                                     target table are local concerns
+
+    That distinction matters: a module dropped on a controller and imported
+    by mistake will execute, and a collector saved under a module name will
+    run against the wrong machine entirely.
 
     Exit codes
         0  everything copied or already up to date
@@ -49,8 +61,17 @@ param(
     # Scoped to -Include and protected by -Exclude, but still destructive.
     [switch]$Mirror,
 
-    [string[]]$Include = @('*.ps1', '*.psm1', '*.psd1'),
-    [string[]]$Exclude = @('deploy.ps1', 'run-remote.ps1'),
+    [string[]]$Include = @('*.ps1'),
+
+    # A controller needs only what collects data. The orchestrators and the
+    # reporting modules run on the workstation and would either do nothing
+    # there or, worse, execute on import.
+    [string[]]$Exclude = @(
+        'deploy.ps1',          # deployment is driven from here, not from a DC
+        'run-remote.ps1',      # same
+        'Audit*.psm1',         # capture, HTML and target modules are local
+        'targets.psd1'         # the target table is local too
+    ),
 
     # Source folder, defaults to the folder this script lives in
     [string]$Source,
@@ -497,4 +518,4 @@ if ($failed.Count) {
 Write-Host "All $($results.Count) target(s) up to date" -ForegroundColor Green
 Write-Host ""
 Write-Host "Next: .\run-remote.ps1 -all" -ForegroundColor DarkGray
-Write-Host ""
+Write-Host ""пше
