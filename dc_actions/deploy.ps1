@@ -86,6 +86,24 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Report where a failure actually happened. Without this a terminating
+# error at script scope is blamed on the line that invoked the script,
+# which tells you nothing.
+trap {
+    Write-Host ''
+    Write-Host 'UNHANDLED ERROR' -ForegroundColor Red
+    Write-Host "  $($_.Exception.GetType().Name): $(($_.Exception.Message -split "`n")[0])" -ForegroundColor Red
+    if ($_.InvocationInfo) {
+        Write-Host "  line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" -ForegroundColor Red
+    }
+    if ($_.ScriptStackTrace) {
+        Write-Host '  stack:' -ForegroundColor DarkGray
+        $_.ScriptStackTrace -split "`n" | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+    }
+    Write-Host ''
+    continue
+}
+
 # ---------------------------------------------------------------
 # Shared target table
 # ---------------------------------------------------------------
