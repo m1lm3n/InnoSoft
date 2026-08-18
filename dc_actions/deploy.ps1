@@ -89,6 +89,9 @@ $ErrorActionPreference = 'Stop'
 # Report where a failure actually happened. Without this a terminating
 # error at script scope is blamed on the line that invoked the script,
 # which tells you nothing.
+# Anything not handled below is a bug, not a condition: report where it
+# happened and stop. Resuming used to leave the script announcing success
+# after a fatal error, which is worse than failing outright.
 trap {
     Write-Host ''
     Write-Host 'UNHANDLED ERROR' -ForegroundColor Red
@@ -101,7 +104,7 @@ trap {
         $_.ScriptStackTrace -split "`n" | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
     }
     Write-Host ''
-    continue
+    exit 2
 }
 
 # ---------------------------------------------------------------
@@ -207,7 +210,11 @@ if (Get-Command git.exe -ErrorAction SilentlyContinue) {
             if ($gitDirty) { $gitInfo += ' (uncommitted changes)' }
         }
     }
-    catch { }
+    catch {
+        # not fatal: the git details are decoration, but do not pretend
+        # nothing happened
+        $gitInfo = "git failed: $(($_.Exception.Message -split "`n")[0])"
+    }
     finally { Pop-Location }
 }
 
@@ -252,16 +259,39 @@ foreach ($dom in $selected) {
 $results = New-Object System.Collections.Generic.List[object]
 
 function Test-HostReachable {
+    <#
+        Returns $true, or $false with a reason in $script:ProbeReason.
+        A name that does not resolve and a port that is closed are very
+        different problems, and reporting both as "unreachable" wasted an
+        afternoon once already.
+    #>
     param([string]$Server)
+
+    $script:ProbeReason = ''
     if ($NoProbe) { return $true }
+
+    # resolution first, so a typo in targets.psd1 is named as such
+    try { [void][System.Net.Dns]::GetHostEntry($Server) }
+    catch {
+        $script:ProbeReason = 'name does not resolve'
+        return $false
+    }
+
     try {
         if ($UsePing) {
-            return [bool](Test-Connection -ComputerName $Server -Count 1 -Quiet -ErrorAction SilentlyContinue)
+            $ok = Test-Connection -ComputerName $Server -Count 1 -Quiet -ErrorAction SilentlyContinue
+            if (-not $ok) { $script:ProbeReason = 'no ping response' }
+            return [bool]$ok
         }
-        return [bool](Test-NetConnection -ComputerName $Server -Port 445 `
-                -InformationLevel Quiet -WarningAction SilentlyContinue)
+        $ok = Test-NetConnection -ComputerName $Server -Port 445 `
+            -InformationLevel Quiet -WarningAction SilentlyContinue
+        if (-not $ok) { $script:ProbeReason = 'TCP 445 closed' }
+        return [bool]$ok
     }
-    catch { return $false }
+    catch {
+        $script:ProbeReason = ($_.Exception.Message -split "`n")[0]
+        return $false
+    }
 }
 
 foreach ($dom in $selected) {
@@ -282,7 +312,7 @@ foreach ($dom in $selected) {
         $share = "\\$server\" + ($RemotePath -replace '^([A-Za-z]):', '$1$')
 
         if (-not (Test-HostReachable -Server $server)) {
-            $how = if ($UsePing) { 'no ping response' } else { 'TCP 445 closed' }
+            $how = if ($script:ProbeReason) { $script:ProbeReason } else { 'unreachable' }
             Write-Host "    unreachable ($how)" -ForegroundColor Red
             $results.Add([PSCustomObject]@{ Domain = $dom; Server = $server; Status = 'unreachable'; Detail = $how })
             continue
@@ -308,9 +338,18 @@ foreach ($dom in $selected) {
 
         # Test-Path throws on access denied instead of returning false,
         # which used to abort the whole run at the first refusal.
+        # Test-Path throws on access denied instead of returning false.
+        # Denied is an expected answer here; anything else is not, so it is
+        # kept and shown rather than folded into a plain "no access".
         $shareOk = $false
+        $shareError = $null
         try { $shareOk = Test-Path "\\$server\c$" -ErrorAction Stop }
-        catch { $shareOk = $false }
+        catch {
+            $shareOk = $false
+            if ($_.Exception -isnot [System.UnauthorizedAccessException]) {
+                $shareError = ($_.Exception.Message -split "`n")[0]
+            }
+        }
 
         if (-not $shareOk -and $PromptOnDenied) {
             Write-Host "    access denied, asking for credentials" -ForegroundColor DarkYellow
@@ -329,6 +368,7 @@ foreach ($dom in $selected) {
 
         if (-not $shareOk) {
             Write-Host "    no access to \\$server\c$" -ForegroundColor Red
+            if ($shareError) { Write-Host "    $shareError" -ForegroundColor DarkYellow }
             if ($cred) {
                 Write-Host "    $($cred.UserName) was refused - check the password or the rights" -ForegroundColor DarkYellow
             }
@@ -394,12 +434,19 @@ foreach ($dom in $selected) {
                 # Files arriving over the network carry the zone marker and
                 # will not run under a stricter execution policy.
                 try {
-                    Get-ChildItem $share -File -Recurse -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Extension -in '.ps1', '.psm1', '.psd1' } |
-                    Unblock-File -ErrorAction SilentlyContinue
-                    Write-Host "    unblocked remote scripts" -ForegroundColor DarkGray
+                    $toUnblock = @(Get-ChildItem $share -File -Recurse -ErrorAction Stop |
+                        Where-Object { $_.Extension -in '.ps1', '.psm1', '.psd1' })
+                    if ($toUnblock.Count) {
+                        # Unblock-File complains about files with no zone
+                        # marker, which is the normal case, so that one is
+                        # deliberately quiet
+                        $toUnblock | Unblock-File -ErrorAction SilentlyContinue
+                        Write-Host "    unblocked $($toUnblock.Count) remote script(s)" -ForegroundColor DarkGray
+                    }
                 }
-                catch { Write-Warning "    could not unblock: $($_.Exception.Message)" }
+                catch {
+                    Write-Warning "    could not list $share to unblock: $(($_.Exception.Message -split "`n")[0])"
+                }
             }
             catch {
                 $status = 'failed'
@@ -421,7 +468,9 @@ foreach ($dom in $selected) {
                     })
                 Write-Host "    would consider $($preview.Count) file(s), copying those newer than the target" -ForegroundColor DarkGray
             }
-            catch { }
+            catch {
+                Write-Host "    could not list the source folder: $(($_.Exception.Message -split "`n")[0])" -ForegroundColor DarkYellow
+            }
             $status = 'skipped (whatif)'
             $detail = 'dry run'
         }
