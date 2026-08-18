@@ -6,4 +6,4 @@ Architecture.md
 .env
 *.cred.xml
 commands.ps1
-.claude
+.claude/.claude/

@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(powershell -NoProfile -Command '$null = [System.Management.Automation.Language.Parser]::ParseFile\\('\\\\''run-remote.ps1'\\\\'', [ref]$null, [ref]\\($errs = @\\(\\)\\)\\); if \\($errs.Count\\) { $errs | ForEach-Object { Write-Output $_.Message } } else { Write-Output '\\\\''OK: no parse errors'\\\\'' }')",
-      "Bash(powershell -NoProfile -Command '$errs=@\\(\\); $null = [System.Management.Automation.Language.Parser]::ParseFile\\('\\\\''run-remote.ps1'\\\\'', [ref]$null, [ref]$errs\\); if \\($errs.Count\\) { $errs | ForEach-Object { Write-Output $_.Message } } else { Write-Output '\\\\''OK'\\\\'' }')"
-    ]
-  }
-}
