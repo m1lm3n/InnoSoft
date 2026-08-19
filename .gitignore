@@ -7,3 +7,9 @@ Architecture.md
 *.cred.xml
 commands.ps1
 .claude/.claude/
+
+# .NET build output (src/)
+[Bb]in/
+[Oo]bj/
+*.user
+appsettings.*.local.json

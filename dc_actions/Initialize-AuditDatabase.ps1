@@ -43,7 +43,11 @@
 
 [CmdletBinding()]
 param(
-    [string]$DbConfigPath = (Join-Path $PSScriptRoot 'db.psd1'),
+    # No $PSScriptRoot-based default here: with [CmdletBinding()], PSScriptRoot
+    # is empty during param default evaluation when invoked via -File from an
+    # external process (confirmed PowerShell 5.1 quirk). Resolved in the
+    # script body instead, where PSScriptRoot is reliable.
+    [string]$DbConfigPath,
 
     [string]$CredentialPath = (Join-Path $env:USERPROFILE '.dc_actions\creds\_db.cred.xml'),
 
@@ -52,6 +56,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not $DbConfigPath) { $DbConfigPath = Join-Path $PSScriptRoot 'db.psd1' }
 
 $dbModule = Join-Path $PSScriptRoot 'AuditDb.psm1'
 if (-not (Test-Path $dbModule)) { throw "AuditDb.psm1 not found next to this script." }

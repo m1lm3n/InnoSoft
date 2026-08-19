@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="AdAudit.Cli/AdAudit.Cli.csproj" />
+  <Project Path="AdAudit.Shared/AdAudit.Shared.csproj" />
+  <Project Path="AdAudit.Web/AdAudit.Web.csproj" />
+</Solution>

@@ -92,7 +92,12 @@ param(
     #     xxx.lo = xxx\adm.olvin
     #     ttt.lo = ttt\adm.olvin
     # Used to prefill the prompt so the account never has to be retyped.
-    [string]$EnvFile = (Join-Path $PSScriptRoot '.env'),
+    # No $PSScriptRoot-based default here: with [CmdletBinding()], PSScriptRoot
+    # is empty during param default evaluation when invoked via -File from an
+    # external process (confirmed PowerShell 5.1 quirk - this is exactly how a
+    # future web-triggered collection job would launch this script). Resolved
+    # in the script body instead, where PSScriptRoot is reliable.
+    [string]$EnvFile,
 
     # Prompt for a credential, store it encrypted, then exit
     [switch]$SetCredential,
@@ -135,6 +140,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $EnvFile) { $EnvFile = Join-Path $here '.env' }
 
 # Output capture, report rendering and the SQL store live in their own
 # modules so this script stays about running things, not about formatting

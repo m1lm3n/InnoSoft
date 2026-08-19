@@ -51,10 +51,15 @@ param(
     # SQL login with sysadmin rights, instead of the current Windows account
     [System.Management.Automation.PSCredential]$AdminCredential,
 
-    [string]$DbConfigPath = (Join-Path $PSScriptRoot 'db.psd1')
+    # No $PSScriptRoot-based default here: with [CmdletBinding()], PSScriptRoot
+    # is empty during param default evaluation when invoked via -File from an
+    # external process (confirmed PowerShell 5.1 quirk). Resolved below.
+    [string]$DbConfigPath
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not $DbConfigPath) { $DbConfigPath = Join-Path $PSScriptRoot 'db.psd1' }
 
 if (-not $SqlServer -or -not $Database) {
     if (-not (Test-Path $DbConfigPath)) { throw "db.psd1 not found at $DbConfigPath and -SqlServer/-Database not given." }

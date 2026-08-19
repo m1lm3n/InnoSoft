@@ -48,7 +48,12 @@ param(
     # Put DependOnService back from the backup file
     [switch]$Revert,
 
-    [string]$BackupPath = (Join-Path $PSScriptRoot 'nla-dependency-backup.csv'),
+    # No $PSScriptRoot-based default here: with [CmdletBinding()], PSScriptRoot
+    # is empty during param default evaluation when the script is invoked via
+    # -File from an external process (confirmed PowerShell 5.1 quirk - works
+    # fine interactively, breaks when launched by another process). Resolved
+    # in the script body instead, where PSScriptRoot is reliable.
+    [string]$BackupPath,
 
     [System.Management.Automation.PSCredential]$Credential,
     [hashtable]$CredentialMap = @{},
@@ -62,6 +67,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not $BackupPath) { $BackupPath = Join-Path $PSScriptRoot 'nla-dependency-backup.csv' }
 
 # Targets come from targets.psd1, shared with deploy.ps1 and run-remote.ps1
 $targetsModule = Join-Path $PSScriptRoot 'AuditTargets.psm1'
