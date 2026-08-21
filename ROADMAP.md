@@ -2,7 +2,11 @@
 
 Working checklist for turning this from a PowerShell+SQL toolkit into the
 full self-hosted stack: SQL Server (storage) → PowerShell/Task Scheduler
-(collectors) → ASP.NET Core/Blazor (backend+UI) → Nginx (gateway).
+(collectors) → ASP.NET Core/Blazor (backend+UI), exposed directly via
+Kestrel + Windows Firewall - no reverse proxy in front of it (decided
+2026-08-21, see Phase 3: Kestrel's modern TLS/limits support plus the
+localhost/internal-only exposure model make nginx unnecessary complexity
+for a self-hosted tool).
 
 Status legend: `[x]` done and verified for real, `[~]` in progress,
 `[ ]` not started.
@@ -166,22 +170,36 @@ and their credentials live in the database, managed through the app.
 Nothing in front of this app yet — currently wide open on whatever port
 it's bound to. Must land before this ever leaves a dev machine.
 
+**No reverse proxy — decided 2026-08-21.** Kestrel is exposed directly:
+modern Kestrel (.NET 5+) has its own HTTPS/TLS, request/connection limits
+and timeouts, which used to be the reason nginx/IIS sat in front of it;
+combined with this app never being meant to reach past localhost/an
+internal VLAN, nginx would just be one more service to install, patch, and
+(as already flagged once) get its WebSocket proxying subtly wrong for the
+SignalR/Interactive-Server circuit. One less moving part for a
+self-hosted tool aimed at admins who aren't necessarily nginx experts.
+
 - [ ] OIDC via a real IdP (Entra ID / Keycloak / Okta / whatever the
-      self-hosting org already has) — `Microsoft.AspNetCore.Authentication.OpenIdConnect`
-      or `oauth2-proxy` in front of nginx
+      self-hosting org already has) — native
+      `Microsoft.AspNetCore.Authentication.OpenIdConnect` middleware in
+      Kestrel (no `oauth2-proxy`/nginx sidecar needed now)
 - [ ] (optional, additional) Kestrel `Negotiate` handler for orgs that
       want native Windows Integrated Auth — not a replacement for OIDC
-- [ ] Nginx reverse proxy in front of Kestrel, configured for WebSocket
-      proxying (`Upgrade`/`Connection: upgrade`, sane timeouts) — required
-      for the SignalR/Interactive-Server circuit to survive behind it
-- [ ] Explicit decision + firewall/binding: who can actually reach this
-      (localhost only vs internal VLAN vs further) — see the
-      credential-vault-paranoia stance already agreed for this project
+- [ ] Rate limiting via ASP.NET Core's native rate-limiting middleware
+      (`Microsoft.AspNetCore.RateLimiting`, built in since .NET 7) where
+      needed (e.g. the Phase 2 "test connection" cooldown) — no nginx
+      `limit_req` required
+- [ ] Windows Firewall rule(s) scoping which hosts/subnets can reach
+      Kestrel's port at all — the actual access-control layer, doing what
+      "nginx as a firewall" was standing in for
+- [ ] Explicit decision on exposure scope (localhost only vs internal VLAN
+      vs further) — see the credential-vault-paranoia stance already
+      agreed for this project
 
 ## Phase 4 — Production deployment
 
-- [ ] `UseWindowsService()` for the backend — likely no NSSM needed for it
-      (native .NET Windows Service hosting); NSSM only for Nginx
+- [ ] `UseWindowsService()` for the backend — native .NET Windows Service
+      hosting, no NSSM needed anywhere now that nginx is out of the picture
 - [ ] Serilog (rolling file sink) + `Microsoft.Extensions.Logging.EventLog`
       for the backend, replacing default console logging
 - [ ] Task Scheduler job for the collector running under `svc_adaudit`,
