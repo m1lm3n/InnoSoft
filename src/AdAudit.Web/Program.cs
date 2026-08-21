@@ -35,6 +35,8 @@ builder.Services.AddDataProtection()
     .PersistKeysToFileSystem(new DirectoryInfo(DataProtectionSettings.KeyringPath))
     .ProtectKeysWithDpapi();
 builder.Services.AddSingleton<DomainCredentialProtector>();
+builder.Services.AddScoped<DomainAdminService>();
+builder.Services.AddSingleton<DomainConnectionTester>();
 
 var app = builder.Build();
 

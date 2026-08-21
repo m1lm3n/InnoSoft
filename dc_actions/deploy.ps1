@@ -78,6 +78,7 @@ param(
         'New-AuditDatabaseLogin.ps1',        # same, DBA-only provisioning step
         'New-AuditWebLogin.ps1',             # same, provisions the web backend's SQL login
         'Import-TargetsToDb.ps1',            # one-off console-side migration, never run on a DC
+        'Test-DomainConnection.ps1',          # Phase 2 web UI helper, launched by the backend, never run on a DC
         'Audit*.psm1',                       # capture, HTML, target and DB modules are local
         'targets.psd1',                      # the target table is local too
         'db.psd1'                            # database connection settings are local too
