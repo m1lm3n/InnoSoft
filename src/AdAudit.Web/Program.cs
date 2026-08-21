@@ -1,7 +1,11 @@
+using AdAudit.Data;
 using AdAudit.Shared.Collection;
+using AdAudit.Shared.Crypto;
 using AdAudit.Web.Components;
 using AdAudit.Web.Hubs;
 using AdAudit.Web.Services;
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -12,6 +16,24 @@ builder.Services.AddRazorComponents()
 builder.Services.AddSignalR();
 builder.Services.AddSingleton<CollectionJobRunner>();
 builder.Services.AddSingleton<CollectionBroadcastService>();
+
+// cfg schema only (Targets/DomainCredentials/AuditLog) via the scoped
+// ad_audit_web login - see New-AuditWebLogin.ps1. Connection string comes
+// from user-secrets locally (`dotnet user-secrets set ConnectionStrings:AdAuditWeb ...`)
+// or real config/secret storage in production - never committed to appsettings.json.
+builder.Services.AddDbContext<AdAuditDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("AdAuditWeb")
+        ?? throw new InvalidOperationException("ConnectionStrings:AdAuditWeb is not configured.")));
+
+// Root key DPAPI-protected on disk (System.Security.Cryptography.ProtectedData
+// under the hood on Windows - the same primitive PowerShell's Export-Clixml
+// uses), keyring shared with the PowerShell collector via the same folder +
+// application name so both sides can decrypt what the other encrypted. Both
+// processes need to run as svc_adaudit for that sharing to actually work.
+builder.Services.AddDataProtection()
+    .SetApplicationName(DataProtectionSettings.ApplicationName)
+    .PersistKeysToFileSystem(new DirectoryInfo(DataProtectionSettings.KeyringPath));
+builder.Services.AddSingleton<DomainCredentialProtector>();
 
 var app = builder.Build();
 

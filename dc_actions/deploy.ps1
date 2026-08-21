@@ -75,6 +75,7 @@ param(
         'run-remote.ps1',                   # same
         'Initialize-AuditDatabase.ps1',      # sets up SQL locally, never run on a DC
         'New-AuditDatabaseLogin.ps1',        # same, DBA-only provisioning step
+        'New-AuditWebLogin.ps1',             # same, provisions the web backend's SQL login
         'Audit*.psm1',                       # capture, HTML, target and DB modules are local
         'targets.psd1',                      # the target table is local too
         'db.psd1'                            # database connection settings are local too
