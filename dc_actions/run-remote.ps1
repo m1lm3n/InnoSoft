@@ -506,20 +506,16 @@ if (-not (Test-Path $targetsModule)) {
 }
 Import-Module $targetsModule -Force -DisableNameChecking
 
-$Targets = Get-AuditTargets -Path $TargetsFile
-
 # SQL (cfg.Targets/cfg.DomainCredentials, see ROADMAP.md Phase 1) is
-# authoritative once it has domains in it - targets.psd1 stays the
-# fallback for as long as it exists, and the only source at all if SQL is
-# unreachable. A domain migrated into SQL is read from there; targets.psd1
-# is not merged in alongside it, to avoid two disagreeing definitions of
-# the same domain floating around.
+# authoritative and is tried first - targets.psd1 is retired (no longer
+# shipped by default) and is only consulted if SQL is unreachable or
+# empty, so Get-AuditTargets -Path (which throws when the file is
+# missing) must NOT run unconditionally before the DB is even checked.
 $script:TargetsFromDb = $false
 if ($script:CanUseDb) {
     try {
         $dbTargets = Get-AuditTargetsFromDb
         if ($dbTargets.Count) {
-            $Targets = $dbTargets
             $script:TargetsFromDb = $true
             Write-Host "Targets: $($dbTargets.Count) domain(s) from SQL (cfg.Targets)" -ForegroundColor DarkGray
         }
@@ -528,9 +524,10 @@ if ($script:CanUseDb) {
         Write-Host "Could not read targets from SQL, falling back to targets.psd1: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
+$Targets = if ($script:TargetsFromDb) { $dbTargets } else { Get-AuditTargets -Path $TargetsFile }
 
 if ($List) {
-    Show-AuditTargets -Path $TargetsFile
+    Show-AuditTargets -Targets $Targets
     return
 }
 

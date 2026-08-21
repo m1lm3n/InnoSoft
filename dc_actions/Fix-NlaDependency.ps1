@@ -70,22 +70,51 @@ $ErrorActionPreference = 'Stop'
 
 if (-not $BackupPath) { $BackupPath = Join-Path $PSScriptRoot 'nla-dependency-backup.csv' }
 
-# Targets come from targets.psd1, shared with deploy.ps1 and run-remote.ps1
+# Targets: cfg.Targets in SQL when reachable (see ROADMAP.md Phase 1 -
+# targets.psd1 itself is retired), falling back to targets.psd1 via
+# AuditTargets.psm1 if SQL is unreachable or that table is empty - same
+# graceful-degradation shape as run-remote.ps1/deploy.ps1, so this script
+# still works standalone even without a database.
 $targetsModule = Join-Path $PSScriptRoot 'AuditTargets.psm1'
 if (-not (Test-Path $targetsModule)) {
-    throw "AuditTargets.psm1 not found next to this script. It reads targets.psd1."
+    throw "AuditTargets.psm1 not found next to this script."
 }
 Import-Module $targetsModule -Force -DisableNameChecking
 
-$Targets = Get-AuditTargets -Path $TargetsFile
+$script:CanUseDb = $false
+$script:TargetsFromDb = $false
+$dbModule = Join-Path $PSScriptRoot 'AuditDb.psm1'
+if (Test-Path $dbModule) {
+    Import-Module $dbModule -Force -DisableNameChecking
+    if (Test-AuditDbConnection) {
+        $script:CanUseDb = $true
+        try {
+            $dbTargets = Get-AuditTargetsFromDb
+            if ($dbTargets.Count) { $script:TargetsFromDb = $true }
+        }
+        catch { Write-Host "Could not read targets from SQL, falling back to targets.psd1: $($_.Exception.Message)" -ForegroundColor Yellow }
+    }
+}
+
+$Targets = if ($script:TargetsFromDb) { $dbTargets } else { Get-AuditTargets -Path $TargetsFile }
 
 # ---------------------------------------------------------------
-# Credentials, same encrypted store as run-remote.ps1
+# Credentials: cfg.DomainCredentials in SQL first when targets came from
+# there, then the encrypted store run-remote.ps1 also uses, then a prompt.
 # ---------------------------------------------------------------
 function Get-DomainCredential {
     param([string]$Dom)
     if ($CredentialMap.ContainsKey($Dom)) { return $CredentialMap[$Dom] }
     if ($Credential) { return $Credential }
+
+    if ($script:TargetsFromDb) {
+        try {
+            $dbCred = Get-DomainCredentialFromDb -Domain $Dom
+            if ($dbCred) { return $dbCred }
+        }
+        catch { Write-Host "Could not read $Dom's credential from SQL, falling back to the local store: $($_.Exception.Message)" -ForegroundColor Yellow }
+    }
+
     $safe = $Dom -replace '[^\w\.\-]', '_'
     $path = Join-Path $CredentialStorePath "$safe.cred.xml"
     if (Test-Path $path) {

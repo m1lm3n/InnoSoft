@@ -36,7 +36,7 @@ Status legend: `[x]` done and verified for real, `[~]` in progress,
       `Initialize-AuditDatabase.ps1`, `New-AuditDatabaseLogin.ps1`,
       `Fix-NlaDependency.ps1`
 
-## Phase 1 — Credential & config store *(current)*
+## Phase 1 — Credential & config store *(complete 2026-08-21)*
 
 Goal: `targets.psd1` + per-domain DPAPI `.cred.xml` files retired; domains
 and their credentials live in the database, managed through the app.
@@ -115,14 +115,43 @@ and their credentials live in the database, managed through the app.
       so a run that actually copied files inherited robocopy's own exit
       code 1 ("files copied") and looked like a failure to anything
       scripting around it.
-- [ ] Retire `targets.psd1`, `AuditTargets.psm1`'s file-reading path, and
-      the per-domain `.cred.xml` store - the DB path is now proven end to
-      end (see above), so this is safe to do, but deleting the fallback
-      files/mechanism is a deliberate, hard-to-reverse step the assistant
-      is holding off on without an explicit go-ahead rather than doing
-      speculatively.
+- [x] `targets.psd1` and the 6 per-domain `.cred.xml` files deleted for
+      real (`_db.cred.xml` - the unrelated SQL login credential - left
+      alone). The 6 credential files were backed up to a local scratch
+      location first, since unlike `targets.psd1` they were never
+      git-tracked and would have been unrecoverable otherwise.
+      `AuditTargets.psm1`/`Get-AuditTargets` are kept as the fallback code
+      path (not deleted) - now correctly only a safety net if SQL is ever
+      unreachable, not the primary source. Also wired the same SQL-first/
+      file-fallback pattern into `Fix-NlaDependency.ps1`, which had the
+      same hard dependency on `targets.psd1` existing and would otherwise
+      have broken outright once the file was gone.
 
-## Phase 2 — Credential management UI
+      **Two more real bugs found by actually deleting the files and
+      re-testing, not just by reasoning about the code** (sixth and
+      seventh of this integration work - see
+      project_web_implementation_progress memory for the full list):
+      `run-remote.ps1`/`deploy.ps1` both called
+      `$Targets = Get-AuditTargets -Path $TargetsFile` *unconditionally,
+      before* checking whether SQL was reachable - harmless while
+      `targets.psd1` still existed (redundant read, silently overwritten
+      by SQL data moments later), but `Get-AuditTargets` throws when the
+      file is missing, so once it was actually deleted this crashed both
+      scripts before the SQL path was ever reached. Separately, `-List` in
+      both scripts called `Show-AuditTargets -Path $TargetsFile`, which
+      re-reads the file **itself**, independently of whatever `$Targets`
+      the main script body had already resolved (from SQL or otherwise) -
+      same crash, different call site. Fixed by re-ordering both scripts
+      to resolve SQL first and only call the file-reading path in the
+      `else` branch of a conditional (matching the pattern
+      `Fix-NlaDependency.ps1` happened to already use correctly), and by
+      giving `Show-AuditTargets` a `-Targets` parameter to print an
+      already-resolved dictionary instead of always re-deriving one from
+      a path. Verified after the fix: `-list` and a real end-to-end
+      collection run both work cleanly with `targets.psd1` and the old
+      `.cred.xml` files completely gone from disk.
+
+## Phase 2 — Credential management UI *(current)*
 
 - [ ] Blazor page: add/edit a domain + its DC credential
   - [ ] Password field is **write-only** — never redisplay a saved

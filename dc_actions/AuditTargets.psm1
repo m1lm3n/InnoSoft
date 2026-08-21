@@ -3,6 +3,16 @@
 
     Loads targets.psd1 and hands back an ordered dictionary.
 
+    Retired as the primary source, kept as the fallback (ROADMAP.md Phase 1)
+        cfg.Targets in SQL (see AuditDb.psm1's Get-AuditTargetsFromDb) is
+        the real source of truth now - run-remote.ps1/deploy.ps1/
+        Fix-NlaDependency.ps1 all read from there when SQL is reachable.
+        This module - and a targets.psd1 file, which no longer ships by
+        default - only matter if SQL is down: Get-AuditTargets below still
+        throws a clear error when the file is missing, which is now the
+        correct behaviour (SQL should be fixed, not silently bypassed with
+        a stale abandoned file) rather than a bug to route around.
+
     Why a module rather than one line in each script
         Import-PowerShellDataFile returns a plain hash table, whose key
         order is not the order they were written in. Domains would then be
@@ -83,11 +93,20 @@ function Show-AuditTargets {
     <#
         .SYNOPSIS
         Prints the target table.
+
+        .PARAMETER Targets
+        An already-loaded ordered dictionary (e.g. from
+        AuditDb.psm1's Get-AuditTargetsFromDb) to print as-is, instead of
+        loading targets.psd1 via -Path. Callers that already resolved
+        their targets (SQL first, file as fallback) must pass this instead
+        of -Path - calling -Path here would re-read the file independently
+        and throw if it does not exist, even when SQL already supplied a
+        perfectly good $Targets moments earlier.
     #>
     [CmdletBinding()]
-    param([string]$Path)
+    param([string]$Path, $Targets)
 
-    $t = Get-AuditTargets -Path $Path
+    $t = if ($PSBoundParameters.ContainsKey('Targets')) { $Targets } else { Get-AuditTargets -Path $Path }
     Write-Host ''
     Write-Host 'Targets:' -ForegroundColor Cyan
     foreach ($k in $t.Keys) {

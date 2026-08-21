@@ -147,12 +147,11 @@ if (-not (Test-Path $targetsModule)) {
 }
 Import-Module $targetsModule -Force -DisableNameChecking
 
-$Targets = Get-AuditTargets -Path $TargetsFile
-
-# SQL (cfg.Targets/cfg.DomainCredentials) is authoritative once it has
-# domains in it, same as run-remote.ps1 - see ROADMAP.md Phase 1.
-# targets.psd1 stays the fallback for as long as it exists, and the only
-# source at all if SQL is unreachable.
+# SQL (cfg.Targets/cfg.DomainCredentials) is authoritative and is tried
+# first, same as run-remote.ps1 - see ROADMAP.md Phase 1. targets.psd1 is
+# retired (no longer shipped by default) and only consulted if SQL is
+# unreachable or empty, so Get-AuditTargets -Path (which throws when the
+# file is missing) must NOT run unconditionally before SQL is even checked.
 $script:CanUseDb = $false
 $script:TargetsFromDb = $false
 $dbModule = Join-Path $PSScriptRoot 'AuditDb.psm1'
@@ -163,7 +162,6 @@ if (Test-Path $dbModule) {
         try {
             $dbTargets = Get-AuditTargetsFromDb
             if ($dbTargets.Count) {
-                $Targets = $dbTargets
                 $script:TargetsFromDb = $true
                 Write-Host "Targets: $($dbTargets.Count) domain(s) from SQL (cfg.Targets)" -ForegroundColor DarkGray
             }
@@ -173,9 +171,10 @@ if (Test-Path $dbModule) {
         }
     }
 }
+$Targets = if ($script:TargetsFromDb) { $dbTargets } else { Get-AuditTargets -Path $TargetsFile }
 
 if ($List) {
-    Show-AuditTargets -Path $TargetsFile
+    Show-AuditTargets -Targets $Targets
     return
 }
 
