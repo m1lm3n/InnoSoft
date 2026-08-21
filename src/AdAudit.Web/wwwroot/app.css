@@ -1,3 +1,91 @@
+/*
+    Structural shell only (MainLayout + NavMenu + page container) - tokens
+    and base rules copied from dc_actions/AuditHtml.psm1's report CSS so
+    the web UI and the generated audit report share one visual language
+    instead of drifting into two. Component-level styling (buttons, forms,
+    tables, etc.) is deliberately deferred to a later styling pass - see
+    ROADMAP.md.
+*/
+:root {
+    --bg: #f5f6f8; --surface: #ffffff; --line: #e3e6ec; --ink: #1c2030; --ink-soft: #5b6376;
+    --high: #d64545; --medium: #c98a1e; --low: #6b7280; --accent: #3a6ff7;
+    --term-bg: #1b1e24;
+    --font-ui: "Segoe UI Variable Text","Segoe UI",-apple-system,BlinkMacSystemFont,Inter,system-ui,sans-serif;
+    --font-mono: "Cascadia Mono","Cascadia Code",ui-monospace,"JetBrains Mono",Consolas,"Courier New",monospace;
+}
+
+html, body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-ui);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+}
+
+.app-header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+    padding: 0 28px;
+    display: flex;
+    align-items: center;
+    gap: 28px;
+    height: 54px;
+}
+
+.app-header .brand {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    color: var(--ink);
+    white-space: nowrap;
+}
+
+.app-nav {
+    display: flex;
+    gap: 2px;
+    height: 100%;
+}
+
+.app-nav a {
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    font-size: 13px;
+    color: var(--ink-soft);
+    text-decoration: none;
+    border-bottom: 2px solid transparent;
+}
+
+.app-nav a:hover {
+    color: var(--ink);
+}
+
+.app-nav a.active {
+    color: var(--ink);
+    font-weight: 600;
+    border-bottom-color: var(--accent);
+}
+
+.page-container {
+    padding: 24px 28px;
+    max-width: 1100px;
+}
+
+.page-container h1 {
+    margin: 0 0 4px;
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: -.01em;
+}
+
+.page-container .sub {
+    color: var(--ink-soft);
+    font-size: 13px;
+    margin-bottom: 16px;
+}
+
 h1:focus {
     outline: none;
 }

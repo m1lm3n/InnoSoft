@@ -9,7 +9,7 @@
 
 <h1>Run collection</h1>
 
-<p class="text-muted">
+<p class="sub">
     First slice of the background-job mechanism: click Run, watch
     run-remote.ps1's output stream in live, in the browser, from a child
     process launched by the backend. No domain picker or database-backed
@@ -27,10 +27,7 @@
     }
 </div>
 
-<pre class="p-3 bg-dark text-light" style="min-height:20rem;max-height:32rem;overflow-y:auto;font-size:0.85rem;">@foreach (var line in _lines)
-{
-@((line.IsError ? "[err] " : "") + $"[{line.Timestamp:HH:mm:ss}] " + line.Text)
-}</pre>
+<pre class="p-3 bg-dark text-light" style="min-height:20rem;max-height:32rem;overflow-y:auto;font-size:0.85rem;">@LogText</pre>
 
 @code {
     private string _domain = "a.lo";
@@ -39,6 +36,9 @@
     private string? _status;
 
     private bool IsRunning => _job is not null && _status is null;
+
+    private string LogText => string.Join('\n', _lines.Select(l =>
+        (l.IsError ? "[err] " : "") + $"[{l.Timestamp:HH:mm:ss}] " + l.Text));
 
     private string StatusBadgeClass => _status switch
     {
