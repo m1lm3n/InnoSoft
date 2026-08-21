@@ -181,15 +181,25 @@ and their credentials live in the database, managed through the app.
       collection run both work cleanly with `targets.psd1` and the old
       `.cred.xml` files completely gone from disk.
 
-## Phase 2 — Credential management UI *(current)*
+## Phase 2 — Credential management UI *(complete 2026-08-21)*
 
-- [ ] Blazor page: add/edit a domain + its DC credential
-  - [ ] Password field is **write-only** — never redisplay a saved
-        password, replace-only on edit
-  - [ ] "Test connection" action against a live DC, with an explicit
-        rate-limit/cooldown specific to that action (real AD lockout risk,
-        not generic API throttling)
-- [ ] Every add/change writes to `AuditLog` (Phase 1 table)
+- [x] Blazor page: add/edit a domain + its DC credential (`/domains`,
+      `Domains.razor` + `DomainAdminService`) — verified for real via a
+      direct SQL round-trip (create → row appears in `cfg.Targets` →
+      delete via UI → row gone → create again), not just by reading the
+      code.
+  - [x] Password field is **write-only** — `EditModel.Password` is never
+        populated from the saved credential on edit (only `Username` is),
+        field starts blank with a "leave blank to keep the existing
+        password" placeholder.
+  - [x] "Test connection" action against a live DC
+        (`DomainConnectionTester`, 30s cooldown keyed by target id) —
+        clicked for real in the browser against a saved credential:
+        `OK: connected to dc.a.lo (remote host: DC)`.
+- [x] Every add/change writes to `AuditLog` (Phase 1 table) — confirmed in
+      SQL: `target.create`/`target.delete`/`credential.set` all present
+      with the correct `Actor`, `credential.set`'s `Detail` carries the
+      username only, never the password.
 
 ## Phase 3 — Auth & network exposure
 
