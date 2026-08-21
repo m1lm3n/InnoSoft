@@ -95,12 +95,32 @@ and their credentials live in the database, managed through the app.
       as `svc_adaudit` (Phase 4, Task Scheduler), not blocking this phase's
       goal below. Can't be driven by the assistant, which can't operate an
       interactive session as another Windows identity.
-- [ ] `run-remote.ps1`/`deploy.ps1` read domain list + credentials from the
-      DB (`cfg.Targets`/`cfg.DomainCredentials`, now populated) instead of
-      `targets.psd1` + `.cred.xml`, decrypting via
-      `AdAudit.CredentialHelper` as a child process
+- [x] `run-remote.ps1`/`deploy.ps1` read domain list + credentials from
+      `cfg.Targets`/`cfg.DomainCredentials` when SQL is reachable, falling
+      back to `targets.psd1` + the DPAPI `.cred.xml` store otherwise (same
+      graceful-degradation shape as the earlier `CanUseDb` pattern) - new
+      `Get-AuditTargetsFromDb`/`Get-DomainCredentialFromDb` in
+      `AuditDb.psm1`, decrypting via `AdAudit.CredentialHelper` as a child
+      process. **Verified for real on the full fleet, not just `a.lo`**:
+      `deploy.ps1 -all` and `run-remote.ps1 -all` both ran clean against
+      all 6 real domains using DB-sourced targets/credentials end to end -
+      every domain logged "using DB-stored credential", every collection
+      succeeded, findings totals matched the expected ballpark from the
+      last known-good run (380/374/436 vs. 380/374/439, normal real-world
+      drift), all 6 saved to SQL, all local CSVs removed. Also found and
+      fixed two more real issues along the way: `Protect-Password` in the
+      migration script leaked a `byte[]` as an unrolled `Object[]` through
+      a bare `return` (same comma-return bug as `AuditHtml.psm1`, see
+      below); `deploy.ps1` had no explicit `exit 0` on its success path,
+      so a run that actually copied files inherited robocopy's own exit
+      code 1 ("files copied") and looked like a failure to anything
+      scripting around it.
 - [ ] Retire `targets.psd1`, `AuditTargets.psm1`'s file-reading path, and
-      the per-domain `.cred.xml` store once the DB path is proven
+      the per-domain `.cred.xml` store - the DB path is now proven end to
+      end (see above), so this is safe to do, but deleting the fallback
+      files/mechanism is a deliberate, hard-to-reverse step the assistant
+      is holding off on without an explicit go-ahead rather than doing
+      speculatively.
 
 ## Phase 2 — Credential management UI
 

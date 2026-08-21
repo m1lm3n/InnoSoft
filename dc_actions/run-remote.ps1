@@ -406,13 +406,29 @@ function Resolve-DomainCredential {
         Order of precedence:
           1. -CredentialMap entry for this domain
           2. -Credential passed on the command line
-          3. encrypted store
-          4. interactive prompt, only when -PromptOnDenied is set
+          3. cfg.DomainCredentials in SQL, when targets came from there
+             (see $script:TargetsFromDb) - the DB is authoritative once a
+             domain has been migrated into it, see Phase 1 of ROADMAP.md
+          4. the legacy per-domain DPAPI .cred.xml store
+          5. interactive prompt, only when -PromptOnDenied is set
     #>
     param([string]$Dom, [string]$Server, [switch]$Interactive)
 
     if ($CredentialMap.ContainsKey($Dom)) { return $CredentialMap[$Dom] }
     if ($Credential) { return $Credential }
+
+    if ($script:TargetsFromDb) {
+        try {
+            $dbCred = Get-DomainCredentialFromDb -Domain $Dom
+            if ($dbCred) {
+                Write-Host "  using DB-stored credential for $($dbCred.UserName)" -ForegroundColor DarkGray
+                return $dbCred
+            }
+        }
+        catch {
+            Write-Host "  could not read $Dom's credential from SQL, falling back to the local store: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
 
     $stored = Import-StoredCredential $Dom
     if ($stored) {
@@ -491,6 +507,27 @@ if (-not (Test-Path $targetsModule)) {
 Import-Module $targetsModule -Force -DisableNameChecking
 
 $Targets = Get-AuditTargets -Path $TargetsFile
+
+# SQL (cfg.Targets/cfg.DomainCredentials, see ROADMAP.md Phase 1) is
+# authoritative once it has domains in it - targets.psd1 stays the
+# fallback for as long as it exists, and the only source at all if SQL is
+# unreachable. A domain migrated into SQL is read from there; targets.psd1
+# is not merged in alongside it, to avoid two disagreeing definitions of
+# the same domain floating around.
+$script:TargetsFromDb = $false
+if ($script:CanUseDb) {
+    try {
+        $dbTargets = Get-AuditTargetsFromDb
+        if ($dbTargets.Count) {
+            $Targets = $dbTargets
+            $script:TargetsFromDb = $true
+            Write-Host "Targets: $($dbTargets.Count) domain(s) from SQL (cfg.Targets)" -ForegroundColor DarkGray
+        }
+    }
+    catch {
+        Write-Host "Could not read targets from SQL, falling back to targets.psd1: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
 
 if ($List) {
     Show-AuditTargets -Path $TargetsFile

@@ -41,9 +41,10 @@
         Audit*.psm1, targets.psd1,      output capture, HTML rendering, the
         db.psd1                         target table and the database
                                          connection settings are local concerns
-        Initialize-AuditDatabase.ps1,    set up the SQL Server database on
-        New-AuditDatabaseLogin.ps1       the workstation/server itself, never
-                                         run against a controller
+        Initialize-AuditDatabase.ps1,    set up the SQL Server database and
+        New-AuditDatabaseLogin.ps1,      migrate data into it on the
+        New-AuditWebLogin.ps1,           workstation/server itself, never
+        Import-TargetsToDb.ps1           run against a controller
 
     That distinction matters: a module dropped on a controller and imported
     by mistake will execute, and a collector saved under a module name will
@@ -76,6 +77,7 @@ param(
         'Initialize-AuditDatabase.ps1',      # sets up SQL locally, never run on a DC
         'New-AuditDatabaseLogin.ps1',        # same, DBA-only provisioning step
         'New-AuditWebLogin.ps1',             # same, provisions the web backend's SQL login
+        'Import-TargetsToDb.ps1',            # one-off console-side migration, never run on a DC
         'Audit*.psm1',                       # capture, HTML, target and DB modules are local
         'targets.psd1',                      # the target table is local too
         'db.psd1'                            # database connection settings are local too
@@ -147,6 +149,31 @@ Import-Module $targetsModule -Force -DisableNameChecking
 
 $Targets = Get-AuditTargets -Path $TargetsFile
 
+# SQL (cfg.Targets/cfg.DomainCredentials) is authoritative once it has
+# domains in it, same as run-remote.ps1 - see ROADMAP.md Phase 1.
+# targets.psd1 stays the fallback for as long as it exists, and the only
+# source at all if SQL is unreachable.
+$script:CanUseDb = $false
+$script:TargetsFromDb = $false
+$dbModule = Join-Path $PSScriptRoot 'AuditDb.psm1'
+if (Test-Path $dbModule) {
+    Import-Module $dbModule -Force -DisableNameChecking
+    if (Test-AuditDbConnection) {
+        $script:CanUseDb = $true
+        try {
+            $dbTargets = Get-AuditTargetsFromDb
+            if ($dbTargets.Count) {
+                $Targets = $dbTargets
+                $script:TargetsFromDb = $true
+                Write-Host "Targets: $($dbTargets.Count) domain(s) from SQL (cfg.Targets)" -ForegroundColor DarkGray
+            }
+        }
+        catch {
+            Write-Host "Could not read targets from SQL, falling back to targets.psd1: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+}
+
 if ($List) {
     Show-AuditTargets -Path $TargetsFile
     return
@@ -206,6 +233,16 @@ function Resolve-DeployCredential {
 
     if ($CredentialMap.ContainsKey($Dom)) { return $CredentialMap[$Dom] }
     if ($Credential) { return $Credential }
+
+    if ($script:TargetsFromDb) {
+        try {
+            $dbCred = Get-DomainCredentialFromDb -Domain $Dom
+            if ($dbCred) { return $dbCred }
+        }
+        catch {
+            Write-Host "    could not read $Dom's credential from SQL, falling back to the local store: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
 
     $stored = Import-StoredCredential -Dom $Dom
     if ($stored) { return $stored }
@@ -527,3 +564,9 @@ Write-Host "All $($results.Count) target(s) up to date" -ForegroundColor Green
 Write-Host ""
 Write-Host "Next: .\run-remote.ps1 -all" -ForegroundColor DarkGray
 Write-Host ""
+
+# Without this, the process exit code is whatever $LASTEXITCODE robocopy
+# happened to leave behind - 1 ("files copied successfully") on any run
+# that actually copied something, which looks like failure to anything
+# scripting around this (a scheduled task, CI) even though nothing failed.
+exit 0

@@ -716,7 +716,135 @@ function Get-RunMetaFromDb {
     finally { $ctx.Connection.Close() }
 }
 
+# ---------------------------------------------------------------
+# Targets/credentials for run-remote.ps1 / deploy.ps1 - the DB-backed
+# replacement for targets.psd1 + the per-domain DPAPI .cred.xml store.
+# ---------------------------------------------------------------
+function Get-AuditTargetsFromDb {
+    <#
+        .SYNOPSIS
+        Same shape AuditTargets.psm1's Get-AuditTargets already returns
+        (ordered dictionary keyed by domain, each entry carrying
+        Server/Trusted/Extra/Note) so callers need no structural changes -
+        sourced from cfg.Targets/cfg.TargetExtraServers instead of
+        targets.psd1. Each entry also carries TargetId, which
+        Get-DomainCredentialFromDb needs; callers that don't know about it
+        just ignore the extra key like any other hashtable consumer would.
+    #>
+    [CmdletBinding()]
+    param([hashtable]$Config)
+    if (-not $Config) { $Config = Get-AuditDbConfig }
+    $ctx = New-AuditDbConnection -Config $Config
+    try {
+        $conn = $ctx.Connection
+        $ordered = [ordered]@{}
+
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = 'SELECT Id, Domain, Server, Trusted, Note FROM cfg.Targets ORDER BY Domain'
+        $rows = New-Object System.Collections.Generic.List[object]
+        $reader = $cmd.ExecuteReader()
+        try {
+            while ($reader.Read()) {
+                $rows.Add([PSCustomObject]@{
+                        Id      = [Guid]$reader['Id']
+                        Domain  = [string]$reader['Domain']
+                        Server  = [string]$reader['Server']
+                        Trusted = [bool]$reader['Trusted']
+                        Note    = $(if ($reader['Note'] -is [DBNull]) { '' } else { [string]$reader['Note'] })
+                    })
+            }
+        }
+        finally { $reader.Close() }
+
+        foreach ($row in $rows) {
+            $extraCmd = $conn.CreateCommand()
+            $extraCmd.CommandText = 'SELECT ServerName FROM cfg.TargetExtraServers WHERE TargetId = @tid'
+            [void]$extraCmd.Parameters.AddWithValue('@tid', $row.Id)
+            $extras = New-Object System.Collections.Generic.List[string]
+            $er = $extraCmd.ExecuteReader()
+            try { while ($er.Read()) { $extras.Add([string]$er['ServerName']) } }
+            finally { $er.Close() }
+
+            $ordered[$row.Domain] = @{
+                TargetId = $row.Id
+                Server   = $row.Server
+                Trusted  = $row.Trusted
+                Extra    = @($extras.ToArray())
+                Note     = $row.Note
+            }
+        }
+
+        return $ordered
+    }
+    finally { $ctx.Connection.Close() }
+}
+
+function Get-DomainCredentialFromDb {
+    <#
+        .SYNOPSIS
+        Looks up a domain's credential in cfg.DomainCredentials and
+        decrypts it via AdAudit.CredentialHelper.exe, launched as a child
+        process - Windows PowerShell 5.1 cannot load the .NET assembly
+        that actually performs the Data Protection decrypt in-process
+        (confirmed empirically: different runtime, loader exception), see
+        project_web_implementation_progress memory.
+
+        .OUTPUTS
+        A PSCredential, or $null if the domain has no target row or no
+        credential yet (not an error - the UI just hasn't been used to add
+        one). Throws only for a genuine decrypt failure.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Domain,
+        [hashtable]$Config
+    )
+    if (-not $Config) { $Config = Get-AuditDbConfig }
+
+    $helperPath = $Config.CredentialHelperPath
+    if ($helperPath -and -not [System.IO.Path]::IsPathRooted($helperPath)) {
+        $helperPath = Join-Path $PSScriptRoot $helperPath
+    }
+    if (-not $helperPath -or -not (Test-Path $helperPath)) {
+        throw "AdAudit.CredentialHelper.exe not found at $helperPath - build src\AdAudit.CredentialHelper, or fix CredentialHelperPath in db.psd1."
+    }
+
+    $ctx = New-AuditDbConnection -Config $Config
+    try {
+        $cmd = $ctx.Connection.CreateCommand()
+        $cmd.CommandText = @'
+SELECT t.Id AS TargetId, dc.Username, dc.EncryptedPassword
+FROM cfg.Targets t
+JOIN cfg.DomainCredentials dc ON dc.TargetId = t.Id
+WHERE t.Domain = @d
+'@
+        [void]$cmd.Parameters.AddWithValue('@d', $Domain)
+        $reader = $cmd.ExecuteReader()
+        $targetId = $null; $username = $null; $encrypted = $null
+        try {
+            if ($reader.Read()) {
+                $targetId = [Guid]$reader['TargetId']
+                $username = [string]$reader['Username']
+                $encrypted = [byte[]]$reader['EncryptedPassword']
+            }
+        }
+        finally { $reader.Close() }
+
+        if (-not $targetId) { return $null }
+
+        $b64 = [Convert]::ToBase64String($encrypted)
+        $plain = $b64 | & $helperPath decrypt --target-id $targetId
+        if ($LASTEXITCODE -ne 0) { throw "AdAudit.CredentialHelper decrypt failed for $Domain (exit $LASTEXITCODE)" }
+
+        $secure = ConvertTo-SecureString -String $plain -AsPlainText -Force
+        $plain = $null
+        return New-Object System.Management.Automation.PSCredential($username, $secure)
+    }
+    finally { $ctx.Connection.Close() }
+}
+
 Export-ModuleMember -Function `
     Get-AuditDbConfig, Test-AuditDbConnection, Initialize-AuditDatabaseSchema, `
     Save-AuditRun, Get-PreviousRunId, Export-RunToCsvFolder, `
-    Get-FindingsFromDb, Get-RunMetaFromDb
+    Get-FindingsFromDb, Get-RunMetaFromDb, `
+    Get-AuditTargetsFromDb, Get-DomainCredentialFromDb
