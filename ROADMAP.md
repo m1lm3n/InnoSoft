@@ -62,7 +62,16 @@ and their credentials live in the database, managed through the app.
 - [x] ASP.NET Core Data Protection API wired up in `AdAudit.Web`
       (`AddDataProtection()`, `PersistKeysToFileSystem` at
       `C:\ProgramData\AdAudit\keys`, `SetApplicationName("AdAudit")`) —
-      supersedes the earlier hand-rolled HKDF/AES-GCM plan
+      supersedes the earlier hand-rolled HKDF/AES-GCM plan. Found and fixed
+      a real bug during the `svc_adaudit` rotation below: `.ProtectKeysWithDpapi()`
+      was never actually called (in both `Program.cs` and
+      `DomainCredentialProtector`'s standalone constructor), so the keyring
+      was sitting on disk as **plaintext** the whole time — the key file
+      literally carried Data Protection's own
+      `<!-- Warning: the key below is in an unencrypted form -->` comment.
+      Confirmed by reading the file directly, not by inspecting the code.
+      Now fixed in both places and verified the newly-generated key uses
+      `DpapiXmlDecryptor` (proper DPAPI wrapper), not the plaintext fallback.
 - [x] Shared encrypt/decrypt logic for PowerShell — **not** `Add-Type`
       loading `AdAudit.Shared` directly as originally planned: confirmed
       empirically that Windows PowerShell 5.1 (.NET Framework) cannot load
@@ -92,13 +101,30 @@ and their credentials live in the database, managed through the app.
       couldn't bind to a `varbinary` column - same class of bug as the
       earlier `AuditHtml.psm1` array-wrapping issue, opposite direction;
       fixed with `return ,` .
-- [ ] Re-running the credential-setting commands under an interactive
-      `runas /user:svc_adaudit powershell.exe` session so the whole chain
-      (DPAPI `_db.cred.xml`, the Data Protection keyring) is consistent
-      under one account - relevant once this actually gets deployed to run
-      as `svc_adaudit` (Phase 4, Task Scheduler), not blocking this phase's
-      goal below. Can't be driven by the assistant, which can't operate an
-      interactive session as another Windows identity.
+- [x] `_db.cred.xml` and the Data Protection keyring rotated to be
+      genuinely consistent under `svc_adaudit`, not just `adm`. Confirmed
+      the assistant cannot drive this directly: `Start-Process -Credential`
+      to launch cross-account fails with `Access is denied` from a
+      non-interactive tool session (no WinSta0/desktop access) — the user
+      ran it themselves, which also surfaced that it needs an **elevated**
+      PowerShell window on this machine (non-elevated failed the same way
+      for the user too, not just the assistant). Sequence run as
+      `svc_adaudit` via `Start-Process -Credential -LoadUserProfile`:
+      wrote a fresh `_db.cred.xml` under svc_adaudit's own profile,
+      decrypted all 6 domains' credentials under the old (plaintext) key,
+      retired that key, re-encrypted all 6 under a brand new
+      DPAPI-protected/svc_adaudit-scoped key, updated
+      `cfg.DomainCredentials`, and verified every domain round-trips —
+      `VERIFY: <domain> -> True` for all 6, `ALL_OK`. Automatic rollback
+      (un-retire the old key) built in and tested by hitting it for real:
+      first run failed on a private, non-exported `AuditDb.psm1` function
+      (`New-AuditDbConnection`) and rolled back cleanly with zero data
+      touched, confirming the safety net actually works before the second,
+      successful run. Also had to grant `svc_adaudit` NTFS read+execute on
+      the repo folder (`icacls ... /grant ... RX /T`) - it had zero access
+      to `adm`'s Documents tree by default, needed to even read
+      `AuditDb.psm1`. Old key kept on disk as `*.xml.retired` (not
+      deleted) as a backup.
 - [x] `run-remote.ps1`/`deploy.ps1` read domain list + credentials from
       `cfg.Targets`/`cfg.DomainCredentials` when SQL is reachable, falling
       back to `targets.psd1` + the DPAPI `.cred.xml` store otherwise (same

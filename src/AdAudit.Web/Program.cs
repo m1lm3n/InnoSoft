@@ -32,7 +32,8 @@ builder.Services.AddDbContext<AdAuditDbContext>(options =>
 // processes need to run as svc_adaudit for that sharing to actually work.
 builder.Services.AddDataProtection()
     .SetApplicationName(DataProtectionSettings.ApplicationName)
-    .PersistKeysToFileSystem(new DirectoryInfo(DataProtectionSettings.KeyringPath));
+    .PersistKeysToFileSystem(new DirectoryInfo(DataProtectionSettings.KeyringPath))
+    .ProtectKeysWithDpapi();
 builder.Services.AddSingleton<DomainCredentialProtector>();
 
 var app = builder.Build();

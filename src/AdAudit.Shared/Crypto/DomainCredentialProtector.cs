@@ -43,7 +43,9 @@ public sealed class DomainCredentialProtector
     private static IDataProtectionProvider CreateStandaloneProvider() =>
         DataProtectionProvider.Create(
             new DirectoryInfo(DataProtectionSettings.KeyringPath),
-            builder => builder.SetApplicationName(DataProtectionSettings.ApplicationName));
+            builder => builder
+                .SetApplicationName(DataProtectionSettings.ApplicationName)
+                .ProtectKeysWithDpapi());
 
     public byte[] Protect(Guid targetId, string plainPassword)
     {
