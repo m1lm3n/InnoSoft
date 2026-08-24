@@ -4,8 +4,12 @@ using AdAudit.Shared.Crypto;
 using AdAudit.Web.Components;
 using AdAudit.Web.Hubs;
 using AdAudit.Web.Services;
+using Microsoft.AspNetCore.Authentication.Negotiate;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -14,6 +18,46 @@ builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
 
 builder.Services.AddSignalR();
+
+// Windows Integrated Auth (Kerberos/NTLM) against this box's own AD - no
+// external IdP for this deployment. See Phase 3 in ROADMAP.md /
+// project_web_architecture_plan memory for why Negotiate over OIDC: this
+// box is already domain-joined with real AD domains to authenticate
+// against, no separate IdP to stand up or maintain.
+//
+// Enforcement (the fallback policy requiring auth on every endpoint) is
+// DISABLED for now - 2026-08-24, hit real friction getting Chrome to do
+// transparent Negotiate SSO against 127.0.0.1 (needs an AuthServerAllowlist
+// browser policy) plus a separate per-account dev-cert mismatch on HTTPS,
+// stacked on top of each other mid-debugging. Re-enable the
+// FallbackPolicy block below once both are sorted out calmly - the
+// services are still registered so nothing about the setup needs
+// redoing, just the requirement itself is off.
+builder.Services.AddAuthentication(NegotiateDefaults.AuthenticationScheme)
+    .AddNegotiate();
+builder.Services.AddAuthorization();
+builder.Services.AddCascadingAuthenticationState();
+
+// Global backstop against a runaway client (a stuck reconnect loop, a
+// misbehaving script) - partitioned by the authenticated Windows account,
+// not remote IP, since every request on this box arrives from 127.0.0.1
+// regardless of who's actually behind it. Not a replacement for
+// DomainConnectionTester's own per-target AD-lockout cooldown (Phase 2) -
+// that one exists because *any* rate of repeated bad credentials against a
+// real DC is dangerous, independent of overall request volume.
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: httpContext.User.Identity?.Name ?? "anonymous",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                Window = TimeSpan.FromSeconds(10),
+                PermitLimit = 200,
+                QueueLimit = 0,
+            }));
+});
 builder.Services.AddSingleton<CollectionJobRunner>();
 builder.Services.AddSingleton<CollectionBroadcastService>();
 
@@ -59,6 +103,10 @@ if (!app.Environment.IsDevelopment())
 }
 app.UseStatusCodePagesWithReExecute("/not-found", createScopeForStatusCodePages: true);
 app.UseHttpsRedirection();
+
+app.UseAuthentication();
+app.UseAuthorization();
+app.UseRateLimiter();
 
 app.UseAntiforgery();
 

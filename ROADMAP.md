@@ -215,22 +215,77 @@ internal VLAN, nginx would just be one more service to install, patch, and
 SignalR/Interactive-Server circuit. One less moving part for a
 self-hosted tool aimed at admins who aren't necessarily nginx experts.
 
-- [ ] OIDC via a real IdP (Entra ID / Keycloak / Okta / whatever the
-      self-hosting org already has) — native
-      `Microsoft.AspNetCore.Authentication.OpenIdConnect` middleware in
-      Kestrel (no `oauth2-proxy`/nginx sidecar needed now)
-- [ ] (optional, additional) Kestrel `Negotiate` handler for orgs that
-      want native Windows Integrated Auth — not a replacement for OIDC
-- [ ] Rate limiting via ASP.NET Core's native rate-limiting middleware
-      (`Microsoft.AspNetCore.RateLimiting`, built in since .NET 7) where
-      needed (e.g. the Phase 2 "test connection" cooldown) — no nginx
-      `limit_req` required
-- [ ] Windows Firewall rule(s) scoping which hosts/subnets can reach
-      Kestrel's port at all — the actual access-control layer, doing what
-      "nginx as a firewall" was standing in for
-- [ ] Explicit decision on exposure scope (localhost only vs internal VLAN
-      vs further) — see the credential-vault-paranoia stance already
-      agreed for this project
+- [x] **Decided 2026-08-21: `Negotiate` (Kerberos/NTLM against this box's
+      own AD) instead of OIDC.** This machine is already domain-joined with
+      real AD domains to authenticate against - no separate IdP to stand up
+      or maintain for a single-user home deployment. OIDC via a real IdP
+      (Entra ID / Keycloak / Okta) stays a future option for a
+      multi-tenant/org deployment, not needed here.
+- [~] `Microsoft.AspNetCore.Authentication.Negotiate` wired up in
+      `Program.cs`, but **enforcement is currently OFF** (`AddAuthorization()`
+      with no fallback policy) - 2026-08-24, hit two stacked real problems
+      trying to verify it live and backed out rather than debug three
+      things at once under pressure:
+      1. Chrome doesn't attempt transparent Kerberos/NTLM SSO against an
+         arbitrary host by default - needs an `AuthServerAllowlist` browser
+         policy (`HKCU\SOFTWARE\Policies\Google\Chrome`) naming
+         `127.0.0.1`/`localhost`, or it falls back to a manual
+         username/password prompt (which defeats the point).
+      2. Separately, the HTTPS dev-cert story broke: `dotnet dev-certs
+         https --trust` is per-Windows-account. `adm` trusted one cert,
+         but Kestrel runs as `svc_adaudit` and presents a *different* one
+         from its own cert store once it also ran the same command -
+         browser shows "Not secure" because the two accounts don't share a
+         trust chain. Fixing this properly means moving off the ephemeral
+         per-account dev cert entirely (one real cert file, ACL'd for
+         `svc_adaudit` to read, referenced explicitly via
+         `Kestrel:Certificates:Default:Path`, its public half imported into
+         every browsing account's trusted root - same shape as the DPAPI
+         keyring precedent) rather than fighting the per-account mismatch.
+
+      `Domains.razor`'s `AuditLog` `Actor` now correctly comes from the
+      authenticated identity (`AuthenticationState`) instead of
+      `Environment.UserName` (which reported the *process's* account,
+      svc_adaudit/adm, not whoever was actually in the browser - a real gap
+      the audit log had this whole time, closed while wiring this up) -
+      this part is done and doesn't depend on enforcement being back on.
+      **Both SSO and the cert fix are deliberately deferred as a separate
+      follow-up item, not urgent** - the app is reachable at
+      `http://127.0.0.1:5034` with no login prompt in the meantime, which
+      is fine given it's already localhost-only + firewalled (see below).
+- [x] Rate limiting via ASP.NET Core's native middleware
+      (`Microsoft.AspNetCore.RateLimiting`, no extra package needed) - a
+      global fixed-window limiter as a backstop against a runaway client,
+      partitioned by the **authenticated Windows account**, not remote IP
+      (every request on this box arrives from 127.0.0.1 regardless of who
+      it's actually from, so IP-based partitioning would be meaningless
+      here). Separate from and does not replace the Phase 2 "test
+      connection" cooldown, which exists specifically for AD-lockout risk,
+      not general request volume.
+- [x] Explicit exposure scope decision: **localhost only.** Enforced twice:
+      `appsettings.json` now pins Kestrel to `http://127.0.0.1:5034`
+      explicitly (previously only `launchSettings.json` bound to
+      `localhost`, which is dev-only and won't apply once this runs as a
+      Windows Service in Phase 4 - an unconfigured Kestrel defaults to
+      `http://+:5000`, all interfaces).
+- [x] Windows Firewall rule blocking inbound to the port from any
+      non-loopback address, as defense-in-depth against a future
+      accidental rebind (loopback traffic bypasses the firewall entirely,
+      so this doesn't close a gap that exists today - it guards against
+      one being introduced later). Applied for real by the user in an
+      elevated window (`New-NetFirewallRule -DisplayName "AdAudit Web -
+      block non-loopback" -Direction Inbound -LocalPort 5034 -Protocol TCP
+      -Action Block -RemoteAddress Any`) - the assistant's own tool session
+      cannot open an elevated window itself (see the "no attached window
+      station" finding in Phase 1).
+
+**Open follow-up, not blocking anything**: turn `Negotiate` enforcement
+back on. Needs, in order: (1) the Chrome `AuthServerAllowlist` policy, (2)
+a real file-based cert replacing the per-account dev cert, (3) re-add the
+`FallbackPolicy` in `Program.cs` (currently commented out with a note
+pointing back here), (4) actually click through it live in a browser
+before calling it done - same "verify for real" standard as everything
+else in this project.
 
 ## Phase 4 — Production deployment
 

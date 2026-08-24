@@ -2,6 +2,7 @@
 @rendermode InteractiveServer
 @using AdAudit.Data
 @using AdAudit.Web.Services
+@using Microsoft.AspNetCore.Components.Authorization
 @inject DomainAdminService Admin
 @inject DomainConnectionTester Tester
 
@@ -166,13 +167,14 @@ else
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .ToList();
 
+        var actor = await GetActorAsync();
         var targetId = await Admin.SaveTargetAsync(
             _editing.Id, _editing.Domain, _editing.Server, _editing.Trusted, _editing.Note,
-            extraServers, Actor);
+            extraServers, actor);
 
         if (!string.IsNullOrWhiteSpace(_editing.Password))
         {
-            await Admin.SetCredentialAsync(targetId, _editing.Username, _editing.Password, Actor);
+            await Admin.SetCredentialAsync(targetId, _editing.Username, _editing.Password, actor);
         }
 
         _editing = null;
@@ -181,7 +183,7 @@ else
 
     private async Task DeleteAsync(Target t)
     {
-        await Admin.DeleteAsync(t.Id, Actor);
+        await Admin.DeleteAsync(t.Id, await GetActorAsync());
         await LoadAsync();
     }
 
@@ -235,7 +237,16 @@ else
         }
     }
 
-    private static string Actor => Environment.UserName;
+    [CascadingParameter]
+    private Task<AuthenticationState>? AuthStateTask { get; set; }
+
+    /// <summary>The signed-in Windows account (Negotiate), not the process's own identity - <see cref="Environment.UserName"/> would report svc_adaudit/whatever ran the backend for every entry, defeating the point of an audit log.</summary>
+    private async Task<string> GetActorAsync()
+    {
+        if (AuthStateTask is null) return "unknown";
+        var state = await AuthStateTask;
+        return state.User.Identity?.Name ?? "unknown";
+    }
 
     private sealed class EditModel
     {
