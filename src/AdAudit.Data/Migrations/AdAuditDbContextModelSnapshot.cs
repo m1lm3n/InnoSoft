@@ -144,6 +144,33 @@ namespace AdAudit.Data.Migrations
                     b.ToTable("TargetExtraServers", "cfg");
                 });
 
+            modelBuilder.Entity("AdAudit.Data.WebUser", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<string>("PasswordHash")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("nvarchar(512)");
+
+                    b.Property<string>("Username")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Username")
+                        .IsUnique();
+
+                    b.ToTable("WebUsers", "cfg");
+                });
+
             modelBuilder.Entity("AdAudit.Data.DomainCredential", b =>
                 {
                     b.HasOne("AdAudit.Data.Target", null)

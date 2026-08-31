@@ -16,6 +16,7 @@ public sealed class AdAuditDbContext(DbContextOptions<AdAuditDbContext> options)
     public DbSet<TargetExtraServer> TargetExtraServers => Set<TargetExtraServer>();
     public DbSet<DomainCredential> DomainCredentials => Set<DomainCredential>();
     public DbSet<AuditLogEntry> AuditLogEntries => Set<AuditLogEntry>();
+    public DbSet<WebUser> WebUsers => Set<WebUser>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -57,6 +58,13 @@ public sealed class AdAuditDbContext(DbContextOptions<AdAuditDbContext> options)
             e.Property(a => a.TargetDomain).HasMaxLength(64);
             e.Property(a => a.Detail).HasMaxLength(2000);
             e.HasIndex(a => a.Timestamp);
+        });
+
+        modelBuilder.Entity<WebUser>(e =>
+        {
+            e.HasIndex(u => u.Username).IsUnique();
+            e.Property(u => u.Username).HasMaxLength(256);
+            e.Property(u => u.PasswordHash).HasMaxLength(512);
         });
     }
 }
