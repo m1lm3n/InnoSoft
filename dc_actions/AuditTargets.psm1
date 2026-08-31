@@ -1,24 +1,31 @@
 <#
     AuditTargets.psm1
 
-    Loads targets.psd1 and hands back an ordered dictionary.
+    Reads the target table from the ADAUDIT_TARGETS environment variable -
+    a JSON array, one object per domain - and hands back an ordered
+    dictionary keyed by domain name. No file, no database: this is a
+    one-shot tool, the caller sets ADAUDIT_TARGETS for the session and runs
+    the script.
 
-    Retired as the primary source, kept as the fallback (ROADMAP.md Phase 1)
-        cfg.Targets in SQL (see AuditDb.psm1's Get-AuditTargetsFromDb) is
-        the real source of truth now - run-remote.ps1/deploy.ps1/
-        Fix-NlaDependency.ps1 all read from there when SQL is reachable.
-        This module - and a targets.psd1 file, which no longer ships by
-        default - only matter if SQL is down: Get-AuditTargets below still
-        throws a clear error when the file is missing, which is now the
-        correct behaviour (SQL should be fixed, not silently bypassed with
-        a stale abandoned file) rather than a bug to route around.
+    Shape:
+        $env:ADAUDIT_TARGETS = '[
+          {"Domain":"a.lo","Server":"dc.a.lo","Username":"a\\olvin","Trusted":true},
+          {"Domain":"nnn.lo","Server":"dc-nnn.nnn.lo","Username":"nnn\\adm","Trusted":false,"Extra":["dc2.nnn.lo"],"Note":"no trust"}
+        ]'
 
-    Why a module rather than one line in each script
-        Import-PowerShellDataFile returns a plain hash table, whose key
-        order is not the order they were written in. Domains would then be
-        processed in an arbitrary sequence, which makes two runs awkward to
-        compare. This restores the file order by reading the keys back out
-        of the text.
+    Fields per entry:
+        Domain    required, the key
+        Server    required, primary DC to connect to
+        Username  optional - prefills the Get-Credential prompt so the
+                  account never has to be retyped; the password is always
+                  asked for interactively, never stored here or anywhere
+                  else
+        Trusted   optional, defaults to $true - $false marks a domain with
+                  no trust to the management domain (needs NTLM +
+                  TrustedHosts, see run-remote.ps1's header)
+        Extra     optional, defaults to [] - additional DC names for the
+                  same domain
+        Note      optional, defaults to '' - shown in -list
 
     Usage
         Import-Module .\AuditTargets.psm1
@@ -29,50 +36,41 @@
 function Get-AuditTargets {
     <#
         .SYNOPSIS
-        Reads the shared target table.
-
-        .PARAMETER Path
-        Location of targets.psd1. Defaults to the folder holding this module.
+        Reads the target table from $env:ADAUDIT_TARGETS.
 
         .PARAMETER Domain
         Return only these domains, in the order given.
     #>
     [CmdletBinding()]
     param(
-        [string]$Path,
         [string[]]$Domain
     )
 
-    if (-not $Path) { $Path = Join-Path $PSScriptRoot 'targets.psd1' }
-
-    if (-not (Test-Path $Path)) {
-        throw "targets.psd1 not found at $Path. It must sit next to the scripts."
+    $raw = $env:ADAUDIT_TARGETS
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        $example = '$env:ADAUDIT_TARGETS = ''[{"Domain":"a.lo","Server":"dc.a.lo","Username":"a\olvin"}]'''
+        throw "ADAUDIT_TARGETS is not set. Example: $example"
     }
 
-    try { $raw = Import-PowerShellDataFile -Path $Path -ErrorAction Stop }
-    catch { throw "targets.psd1 could not be parsed: $($_.Exception.Message)" }
+    try { $parsed = $raw | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "ADAUDIT_TARGETS could not be parsed as JSON: $($_.Exception.Message)" }
 
-    if (-not $raw -or $raw.Count -eq 0) { throw "targets.psd1 is empty" }
+    $entries = @($parsed)
+    if (-not $entries.Count) { throw "ADAUDIT_TARGETS parsed to an empty list" }
 
-    # recover the order the domains were written in
-    $text = Get-Content $Path -Raw
     $ordered = [ordered]@{}
-    foreach ($m in [regex]::Matches($text, "(?m)^\s*'([^']+)'\s*=\s*@\{")) {
-        $key = $m.Groups[1].Value
-        if ($raw.Contains($key) -and -not $ordered.Contains($key)) { $ordered[$key] = $raw[$key] }
-    }
-    # anything the regex missed still goes in, so nothing is silently lost
-    foreach ($k in $raw.Keys) {
-        if (-not $ordered.Contains($k)) { $ordered[$k] = $raw[$k] }
-    }
+    foreach ($e in $entries) {
+        if (-not $e.Domain) { throw "ADAUDIT_TARGETS: an entry is missing 'Domain'" }
+        if (-not $e.Server) { throw "ADAUDIT_TARGETS: '$($e.Domain)' has no Server" }
+        if ($ordered.Contains($e.Domain)) { throw "ADAUDIT_TARGETS: duplicate domain '$($e.Domain)'" }
 
-    # fill in defaults so callers never have to test for a missing field
-    foreach ($k in @($ordered.Keys)) {
-        $entry = $ordered[$k]
-        if (-not $entry.Contains('Server')) { throw "targets.psd1: '$k' has no Server" }
-        if (-not $entry.Contains('Trusted')) { $entry['Trusted'] = $true }
-        if (-not $entry.Contains('Extra')) { $entry['Extra'] = @() }
-        if (-not $entry.Contains('Note')) { $entry['Note'] = '' }
+        $ordered[$e.Domain] = @{
+            Server   = $e.Server
+            Username = if ($e.PSObject.Properties.Name -contains 'Username') { $e.Username } else { '' }
+            Trusted  = if ($e.PSObject.Properties.Name -contains 'Trusted') { [bool]$e.Trusted } else { $true }
+            Extra    = if ($e.PSObject.Properties.Name -contains 'Extra') { @($e.Extra) } else { @() }
+            Note     = if ($e.PSObject.Properties.Name -contains 'Note') { "$($e.Note)" } else { '' }
+        }
     }
 
     if ($Domain) {
@@ -95,18 +93,13 @@ function Show-AuditTargets {
         Prints the target table.
 
         .PARAMETER Targets
-        An already-loaded ordered dictionary (e.g. from
-        AuditDb.psm1's Get-AuditTargetsFromDb) to print as-is, instead of
-        loading targets.psd1 via -Path. Callers that already resolved
-        their targets (SQL first, file as fallback) must pass this instead
-        of -Path - calling -Path here would re-read the file independently
-        and throw if it does not exist, even when SQL already supplied a
-        perfectly good $Targets moments earlier.
+        An already-loaded ordered dictionary to print, instead of reloading
+        from ADAUDIT_TARGETS.
     #>
     [CmdletBinding()]
-    param([string]$Path, $Targets)
+    param($Targets)
 
-    $t = if ($PSBoundParameters.ContainsKey('Targets')) { $Targets } else { Get-AuditTargets -Path $Path }
+    $t = if ($PSBoundParameters.ContainsKey('Targets')) { $Targets } else { Get-AuditTargets }
     Write-Host ''
     Write-Host 'Targets:' -ForegroundColor Cyan
     foreach ($k in $t.Keys) {

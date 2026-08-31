@@ -1,0 +1,12 @@
+C:\Users\adm\Documents\Projects\InnoSoft\ad_audit\src\AdAudit.Shared\bin\Debug\net10.0\AdAudit.Shared.deps.json
+C:\Users\adm\Documents\Projects\InnoSoft\ad_audit\src\AdAudit.Shared\bin\Debug\net10.0\AdAudit.Shared.dll
+C:\Users\adm\Documents\Projects\InnoSoft\ad_audit\src\AdAudit.Shared\bin\Debug\net10.0\AdAudit.Shared.pdb
+C:\Users\adm\Documents\Projects\InnoSoft\ad_audit\src\AdAudit.Shared\obj\Debug\net10.0\AdAudit.Shared.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\adm\Documents\Projects\InnoSoft\ad_audit\src\AdAudit.Shared\obj\Debug\net10.0\AdAudit.Shared.AssemblyInfoInputs.cache
+C:\Users\adm\Documents\Projects\InnoSoft\ad_audit\src\AdAudit.Shared\obj\Debug\net10.0\AdAudit.Shared.AssemblyInfo.cs
+C:\Users\adm\Documents\Projects\InnoSoft\ad_audit\src\AdAudit.Shared\obj\Debug\net10.0\AdAudit.Shared.csproj.CoreCompileInputs.cache
+C:\Users\adm\Documents\Projects\InnoSoft\ad_audit\src\AdAudit.Shared\obj\Debug\net10.0\AdAudit.Shared.sourcelink.json
+C:\Users\adm\Documents\Projects\InnoSoft\ad_audit\src\AdAudit.Shared\obj\Debug\net10.0\AdAudit.Shared.dll
+C:\Users\adm\Documents\Projects\InnoSoft\ad_audit\src\AdAudit.Shared\obj\Debug\net10.0\refint\AdAudit.Shared.dll
+C:\Users\adm\Documents\Projects\InnoSoft\ad_audit\src\AdAudit.Shared\obj\Debug\net10.0\AdAudit.Shared.pdb
+C:\Users\adm\Documents\Projects\InnoSoft\ad_audit\src\AdAudit.Shared\obj\Debug\net10.0\ref\AdAudit.Shared.dll

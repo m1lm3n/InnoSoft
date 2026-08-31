@@ -57,70 +57,37 @@ param(
 
     [System.Management.Automation.PSCredential]$Credential,
     [hashtable]$CredentialMap = @{},
-    [string]$CredentialStorePath = (Join-Path $env:USERPROFILE '.dc_actions\creds'),
 
     [ValidateSet('Default', 'Kerberos', 'Negotiate')]
-    [string]$Authentication = 'Negotiate',
-
-    # Alternative target table, defaults to targets.psd1 beside the script
-    [string]$TargetsFile
+    [string]$Authentication = 'Negotiate'
 )
 
 $ErrorActionPreference = 'Stop'
 
 if (-not $BackupPath) { $BackupPath = Join-Path $PSScriptRoot 'nla-dependency-backup.csv' }
 
-# Targets: cfg.Targets in SQL when reachable (see ROADMAP.md Phase 1 -
-# targets.psd1 itself is retired), falling back to targets.psd1 via
-# AuditTargets.psm1 if SQL is unreachable or that table is empty - same
-# graceful-degradation shape as run-remote.ps1/deploy.ps1, so this script
-# still works standalone even without a database.
+# Targets come from $env:ADAUDIT_TARGETS, see AuditTargets.psm1's header.
 $targetsModule = Join-Path $PSScriptRoot 'AuditTargets.psm1'
 if (-not (Test-Path $targetsModule)) {
     throw "AuditTargets.psm1 not found next to this script."
 }
 Import-Module $targetsModule -Force -DisableNameChecking
 
-$script:CanUseDb = $false
-$script:TargetsFromDb = $false
-$dbModule = Join-Path $PSScriptRoot 'AuditDb.psm1'
-if (Test-Path $dbModule) {
-    Import-Module $dbModule -Force -DisableNameChecking
-    if (Test-AuditDbConnection) {
-        $script:CanUseDb = $true
-        try {
-            $dbTargets = Get-AuditTargetsFromDb
-            if ($dbTargets.Count) { $script:TargetsFromDb = $true }
-        }
-        catch { Write-Host "Could not read targets from SQL, falling back to targets.psd1: $($_.Exception.Message)" -ForegroundColor Yellow }
-    }
-}
-
-$Targets = if ($script:TargetsFromDb) { $dbTargets } else { Get-AuditTargets -Path $TargetsFile }
+$Targets = Get-AuditTargets
 
 # ---------------------------------------------------------------
-# Credentials: cfg.DomainCredentials in SQL first when targets came from
-# there, then the encrypted store run-remote.ps1 also uses, then a prompt.
+# Credentials - nothing stored, prompt once per domain, prefilled with the
+# Username from $env:ADAUDIT_TARGETS if that domain had one.
 # ---------------------------------------------------------------
 function Get-DomainCredential {
     param([string]$Dom)
     if ($CredentialMap.ContainsKey($Dom)) { return $CredentialMap[$Dom] }
     if ($Credential) { return $Credential }
 
-    if ($script:TargetsFromDb) {
-        try {
-            $dbCred = Get-DomainCredentialFromDb -Domain $Dom
-            if ($dbCred) { return $dbCred }
-        }
-        catch { Write-Host "Could not read $Dom's credential from SQL, falling back to the local store: $($_.Exception.Message)" -ForegroundColor Yellow }
-    }
-
-    $safe = $Dom -replace '[^\w\.\-]', '_'
-    $path = Join-Path $CredentialStorePath "$safe.cred.xml"
-    if (Test-Path $path) {
-        try { return Import-Clixml $path } catch { }
-    }
-    return (Get-Credential -Message "Credentials for $Dom")
+    $hint = "$($Targets[$Dom].Username)"
+    $msg = "Credentials for $Dom"
+    if ($hint) { return (Get-Credential -Message $msg -UserName $hint) }
+    return (Get-Credential -Message $msg)
 }
 
 function Convert-NetworkCategory {

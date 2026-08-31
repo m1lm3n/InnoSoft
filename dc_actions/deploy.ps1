@@ -2,19 +2,16 @@
     deploy.ps1
 
     Copies the audit toolkit to the domain controllers listed in
-    targets.psd1.
+    $env:ADAUDIT_TARGETS (see AuditTargets.psm1's header for the JSON
+    shape).
 
     Copying is done with robocopy /XO, so unchanged files are skipped and a
     file that is newer on the controller is never overwritten by an older
     local one.
 
-    Credentials come from the same encrypted store run-remote.ps1 fills:
-
-        .\run-remote.ps1 -all -setcredential
-
-    After that a plain .\deploy.ps1 -all works from any console, with no
-    runas needed. Order of precedence: -CredentialMap, -Credential, the
-    store, then a prompt when -PromptOnDenied is given.
+    Nothing is stored: a credential is asked for interactively once per
+    domain (prefilled with the Username from $env:ADAUDIT_TARGETS if that
+    domain had one), reused for every host in that domain.
 
     Reachability is checked on TCP 445 rather than ICMP, which is blocked
     across this estate. Use -UsePing to go back to a ping.
@@ -38,13 +35,8 @@
     What deliberately does not
         deploy.ps1, run-remote.ps1      deployment and orchestration are
                                          driven from the workstation
-        Audit*.psm1, targets.psd1,      output capture, HTML rendering, the
-        db.psd1                         target table and the database
-                                         connection settings are local concerns
-        Initialize-AuditDatabase.ps1,    set up the SQL Server database and
-        New-AuditDatabaseLogin.ps1,      migrate data into it on the
-        New-AuditWebLogin.ps1,           workstation/server itself, never
-        Import-TargetsToDb.ps1           run against a controller
+        Audit*.psm1                     output capture and HTML rendering
+                                         are workstation-only concerns
 
     That distinction matters: a module dropped on a controller and imported
     by mistake will execute, and a collector saved under a module name will
@@ -74,14 +66,7 @@ param(
     [string[]]$Exclude = @(
         'deploy.ps1',                       # deployment is driven from here, not from a DC
         'run-remote.ps1',                   # same
-        'Initialize-AuditDatabase.ps1',      # sets up SQL locally, never run on a DC
-        'New-AuditDatabaseLogin.ps1',        # same, DBA-only provisioning step
-        'New-AuditWebLogin.ps1',             # same, provisions the web backend's SQL login
-        'Import-TargetsToDb.ps1',            # one-off console-side migration, never run on a DC
-        'Test-DomainConnection.ps1',          # Phase 2 web UI helper, launched by the backend, never run on a DC
-        'Audit*.psm1',                       # capture, HTML, target and DB modules are local
-        'targets.psd1',                      # the target table is local too
-        'db.psd1'                            # database connection settings are local too
+        'Audit*.psm1'                        # capture and HTML rendering modules are local
     ),
 
     # Source folder, defaults to the folder this script lives in
@@ -90,7 +75,7 @@ param(
     # Destination on each controller, as a local path
     [string]$RemotePath = 'C:\scripts',
 
-    # Also copy to the extra controllers named in targets.psd1
+    # Also copy to the extra controllers named in $env:ADAUDIT_TARGETS
     [switch]$IncludeExtra,
 
     # Skip the reachability test entirely
@@ -104,16 +89,7 @@ param(
 
     [System.Management.Automation.PSCredential]$Credential,
     [hashtable]$CredentialMap = @{},
-    [switch]$PromptOnDenied,
-
-    [string]$CredentialStorePath = (Join-Path $env:USERPROFILE '.dc_actions\creds'),
-    [switch]$NoCredentialStore,
-
-    # Usernames only, used to prefill the credential prompt
-    [string]$EnvFile,
-
-    # Alternative target table
-    [string]$TargetsFile
+    [switch]$PromptOnDenied
 )
 
 $ErrorActionPreference = 'Stop'
@@ -140,39 +116,16 @@ trap {
 }
 
 # ---------------------------------------------------------------
-# Shared target table
+# Shared target table - $env:ADAUDIT_TARGETS, see AuditTargets.psm1
 # ---------------------------------------------------------------
 $targetsModule = Join-Path $PSScriptRoot 'AuditTargets.psm1'
 if (-not (Test-Path $targetsModule)) {
-    throw "AuditTargets.psm1 not found beside this script. It reads targets.psd1."
+    throw "AuditTargets.psm1 not found beside this script."
 }
 Import-Module $targetsModule -Force -DisableNameChecking
 
-# SQL (cfg.Targets/cfg.DomainCredentials) is authoritative and is tried
-# first, same as run-remote.ps1 - see ROADMAP.md Phase 1. targets.psd1 is
-# retired (no longer shipped by default) and only consulted if SQL is
-# unreachable or empty, so Get-AuditTargets -Path (which throws when the
-# file is missing) must NOT run unconditionally before SQL is even checked.
-$script:CanUseDb = $false
-$script:TargetsFromDb = $false
-$dbModule = Join-Path $PSScriptRoot 'AuditDb.psm1'
-if (Test-Path $dbModule) {
-    Import-Module $dbModule -Force -DisableNameChecking
-    if (Test-AuditDbConnection) {
-        $script:CanUseDb = $true
-        try {
-            $dbTargets = Get-AuditTargetsFromDb
-            if ($dbTargets.Count) {
-                $script:TargetsFromDb = $true
-                Write-Host "Targets: $($dbTargets.Count) domain(s) from SQL (cfg.Targets)" -ForegroundColor DarkGray
-            }
-        }
-        catch {
-            Write-Host "Could not read targets from SQL, falling back to targets.psd1: $($_.Exception.Message)" -ForegroundColor Yellow
-        }
-    }
-}
-$Targets = if ($script:TargetsFromDb) { $dbTargets } else { Get-AuditTargets -Path $TargetsFile }
+$Targets = Get-AuditTargets
+Write-Host "Targets: $($Targets.Count) domain(s) from `$env:ADAUDIT_TARGETS" -ForegroundColor DarkGray
 
 if ($List) {
     Show-AuditTargets -Targets $Targets
@@ -185,74 +138,24 @@ if ($List) {
 if (-not $Source) { $Source = $PSScriptRoot }
 if (-not (Test-Path $Source)) { throw "Source folder not found: $Source" }
 
-if (-not $EnvFile) { $EnvFile = Join-Path $Source '.env' }
-
 # Guard against a rename: never ship this file under whatever name it has
 $selfName = Split-Path -Leaf $PSCommandPath
 if ($selfName -and $Exclude -notcontains $selfName) { $Exclude += $selfName }
 
 # ---------------------------------------------------------------
-# Credentials
+# Credentials - nothing stored. Prompt once per domain, prefilled with the
+# Username from $env:ADAUDIT_TARGETS if that domain had one.
 # ---------------------------------------------------------------
-function Import-StoredCredential {
-    param([string]$Dom)
-    if ($NoCredentialStore) { return $null }
-    $safe = $Dom -replace '[^\w\.\-]', '_'
-    $path = Join-Path $CredentialStorePath "$safe.cred.xml"
-    if (-not (Test-Path $path)) { return $null }
-    try { return Import-Clixml -Path $path }
-    catch {
-        Write-Warning "Stored credential for $Dom is unusable: $($_.Exception.Message)"
-        return $null
-    }
-}
-
-function Import-EnvUsernames {
-    $map = @{}
-    if (-not (Test-Path $EnvFile)) { return $map }
-    foreach ($line in (Get-Content $EnvFile)) {
-        $t = "$line".Trim()
-        if (-not $t) { continue }
-        if ($t.StartsWith('#')) { continue }
-        $parts = $t -split '=', 2
-        if ($parts.Count -ne 2) { continue }
-        $k = $parts[0].Trim()
-        $v = $parts[1].Trim() -replace '^["'']|["'']$', ''
-        if ($k -and $v) { $map[$k] = $v }
-    }
-    return $map
-}
-
-$EnvUsers = Import-EnvUsernames
-if ($EnvUsers.Count) {
-    Write-Host "Loaded $($EnvUsers.Count) username hint(s) from $EnvFile" -ForegroundColor DarkGray
-}
-
 function Resolve-DeployCredential {
     param([string]$Dom, [string]$Server, [switch]$Interactive)
 
     if ($CredentialMap.ContainsKey($Dom)) { return $CredentialMap[$Dom] }
     if ($Credential) { return $Credential }
-
-    if ($script:TargetsFromDb) {
-        try {
-            $dbCred = Get-DomainCredentialFromDb -Domain $Dom
-            if ($dbCred) { return $dbCred }
-        }
-        catch {
-            Write-Host "    could not read $Dom's credential from SQL, falling back to the local store: $($_.Exception.Message)" -ForegroundColor Yellow
-        }
-    }
-
-    $stored = Import-StoredCredential -Dom $Dom
-    if ($stored) { return $stored }
-
     if (-not $Interactive) { return $null }
 
     $msg = "Credentials for $Dom ($Server)"
-    if ($EnvUsers.ContainsKey($Dom)) {
-        return (Get-Credential -Message $msg -UserName $EnvUsers[$Dom])
-    }
+    $hint = "$($Targets[$Dom].Username)"
+    if ($hint) { return (Get-Credential -Message $msg -UserName $hint) }
     return (Get-Credential -Message $msg)
 }
 
@@ -336,7 +239,7 @@ function Test-HostReachable {
     $script:ProbeReason = ''
     if ($NoProbe) { return $true }
 
-    # resolution first, so a typo in targets.psd1 is named as such
+    # resolution first, so a typo in ADAUDIT_TARGETS is named as such
     try { [void][System.Net.Dns]::GetHostEntry($Server) }
     catch {
         $script:ProbeReason = 'name does not resolve'
@@ -365,7 +268,7 @@ foreach ($dom in $selected) {
     Write-Host ""
     Write-Host ("--- $dom " + ('-' * [Math]::Max(0, 44 - $dom.Length))) -ForegroundColor Cyan
 
-    $cred = Resolve-DeployCredential -Dom $dom -Server $Targets[$dom].Server
+    $cred = Resolve-DeployCredential -Dom $dom -Server $Targets[$dom].Server -Interactive
     if ($cred) { Write-Host "  credential: $($cred.UserName)" -ForegroundColor DarkGray }
 
     foreach ($server in $hostsFor[$dom]) {
@@ -439,8 +342,7 @@ foreach ($dom in $selected) {
                 Write-Host "    $($cred.UserName) was refused - check the password or the rights" -ForegroundColor DarkYellow
             }
             else {
-                Write-Host "    no credential for this domain. Store one once:" -ForegroundColor DarkYellow
-                Write-Host "      .\run-remote.ps1 -domain $dom -setcredential" -ForegroundColor DarkYellow
+                Write-Host "    no credential for this domain - rerun with -promptondenied" -ForegroundColor DarkYellow
             }
             if ($driveName) { Remove-PSDrive -Name $driveName -Force -ErrorAction SilentlyContinue -WhatIf:$false }
             $results.Add([PSCustomObject]@{ Domain = $dom; Server = $server; Status = 'no access'; Detail = 'admin share unreachable' })

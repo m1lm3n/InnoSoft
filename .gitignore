@@ -8,8 +8,3 @@ Architecture.md
 commands.ps1
 .claude/
 .vscode/
-# .NET build output (src/)
-[Bb]in/
-[Oo]bj/
-*.user
-appsettings.*.local.json

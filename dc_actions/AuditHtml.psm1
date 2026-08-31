@@ -58,25 +58,10 @@ function ConvertTo-CssClass {
 function Get-FindingsForDomain {
     <#
         Collects every finding recorded for a domain and tags each row with
-        the toolkit it came from.
-
-        -RunId reads from SQL (Get-FindingsFromDb, exported by AuditDb.psm1
-        - the caller must have imported it already, same as this module
-        never imports its own dependencies). -DataPath/-Domain is the
-        original CSV-folder path, kept as the fallback used when a
-        domain's database load failed and its dated folder was left on
-        disk instead of deleted (see run-remote.ps1).
+        the toolkit it came from - reads the dated CSV folder run-remote.ps1
+        collected, which is kept on disk permanently (no database).
     #>
-    param([int]$RunId, [string]$DataPath, [string]$Domain)
-
-    if ($RunId) {
-        # Get-FindingsFromDb already returns a comma-protected array; wrapping
-        # it again here (`return , @(...)`) nests it into a 1-element array
-        # whose single element is the real array, which made every severity
-        # filter downstream match "1 item" instead of the real count.
-        try { return Get-FindingsFromDb -RunId $RunId }
-        catch { Write-Warning "Could not read findings for RunId $RunId from SQL: $($_.Exception.Message)"; return , @() }
-    }
+    param([string]$DataPath, [string]$Domain)
 
     $map = @{
         "$Domain-findings.csv"            = 'Group Policy'
@@ -143,14 +128,7 @@ function Compare-FindingSets {
 }
 
 function Get-MetaForDomain {
-    # -RunId reads from SQL (Get-RunMetaFromDb); -DataPath/-Domain is the
-    # CSV fallback - see Get-FindingsForDomain's comment above.
-    param([int]$RunId, [string]$DataPath, [string]$Domain)
-
-    if ($RunId) {
-        try { return Get-RunMetaFromDb -RunId $RunId }
-        catch { Write-Warning "Could not read metadata for RunId $RunId from SQL: $($_.Exception.Message)"; return [ordered]@{} }
-    }
+    param([string]$DataPath, [string]$Domain)
 
     $out = [ordered]@{}
     foreach ($f in @("$Domain-meta.csv", "$Domain-adhealth-meta.csv", "$Domain-adsecurity-meta.csv")) {
@@ -208,9 +186,8 @@ function New-AuditHtmlReport {
     # ---------- totals ----------
     $grand = @{ high = 0; medium = 0; low = 0; new = 0; resolved = 0 }
     $prepared = foreach ($d in $domains) {
-        $runId = $(if ($d.PSObject.Properties.Name -contains 'RunId') { $d.RunId } else { $null })
-        $findings = if ($runId) { Get-FindingsForDomain -RunId $runId } else { Get-FindingsForDomain -DataPath $d.DataPath -Domain $d.Domain }
-        $meta = if ($runId) { Get-MetaForDomain -RunId $runId } else { Get-MetaForDomain -DataPath $d.DataPath -Domain $d.Domain }
+        $findings = Get-FindingsForDomain -DataPath $d.DataPath -Domain $d.Domain
+        $meta = Get-MetaForDomain -DataPath $d.DataPath -Domain $d.Domain
         $counts = @{
             high   = @($findings | Where-Object { $_.Severity -eq 'high' }).Count
             medium = @($findings | Where-Object { $_.Severity -eq 'medium' }).Count
@@ -220,24 +197,16 @@ function New-AuditHtmlReport {
         $grand.medium += $counts.medium
         $grand.low += $counts.low
 
-        # ---- baseline ----
-        # PreviousRunId (SQL) takes precedence over BaselinePath (the old
-        # "previous dated folder on disk" scheme, kept as the fallback for
-        # a domain whose database load failed - see run-remote.ps1).
+        # ---- baseline: the previous dated folder on disk, if any ----
         $diff = $null
         $baseCounts = $null
         $baseLabel = ''
-        $prevRunId = $(if ($d.PSObject.Properties.Name -contains 'PreviousRunId') { $d.PreviousRunId } else { $null })
         $basePath = $null
         if ($d.PSObject.Properties.Name -contains 'BaselinePath') { $basePath = $d.BaselinePath }
 
         $baseFindings = $null
         $baseSource = $null
-        if ($prevRunId) {
-            $baseFindings = Get-FindingsForDomain -RunId $prevRunId
-            $baseSource = "run $prevRunId"
-        }
-        elseif ($basePath -and (Test-Path $basePath)) {
+        if ($basePath -and (Test-Path $basePath)) {
             $baseFindings = Get-FindingsForDomain -DataPath $basePath -Domain $d.Domain
             $baseSource = Split-Path $basePath -Leaf
         }

@@ -6,7 +6,12 @@
     network from a workstation: everything the scripts read is local to the
     controller, so a domain finishes in seconds instead of an hour.
 
-    Targets come from the same table as deploy.ps1 - keep them in step.
+    One-shot tool: nothing persists between runs except the CSV folders
+    themselves (kept on disk under -LocalRoot as the baseline for the next
+    run's comparison) and the HTML report. No database, no stored
+    credentials - targets and usernames come from $env:ADAUDIT_TARGETS
+    (see AuditTargets.psm1's header for the JSON shape), passwords are
+    asked for interactively every run.
 
     Usage:
         .\run-remote.ps1                       # default domain
@@ -16,30 +21,16 @@
         .\run-remote.ps1 -all -promptondenied
         .\run-remote.ps1 -list
 
-    Credentials:
-        .\run-remote.ps1 -all -setcredential      # ask once, store encrypted
-        .\run-remote.ps1 -all                     # later runs use the store
-
-    Passwords are encrypted with DPAPI and readable only by the Windows
-    account that saved them, on the machine that saved them. A .env file
-    beside this script may hold USERNAMES only, to prefill the prompt:
-
-        xxx.lo = xxx\adm.olvin
-        ttt.lo = ttt\adm.olvin
-
-    Add .env and the credential store to .gitignore.
-
     Authentication:
         Negotiate is the default here. Kerberos, which PowerShell would use
         on its own, fails when this workstation belongs to a different
         domain from the controller. Override with -authentication if needed.
 
     Trusts:
-        core64.com has forest trusts with kkk.lo, xxx.lo, a.lo and c.lo.
-        nnn.lo and ttt.lo are standalone forests with no trust at all, so a
-        workstation in core64.com cannot use Kerberos against them. They are
-        marked Trusted = $false in the target table and need NTLM, which WinRM
-        only permits for hosts listed in TrustedHosts:
+        Domains marked "Trusted": false in $env:ADAUDIT_TARGETS have no
+        trust to the management domain, so Kerberos cannot work there. They
+        need NTLM, which WinRM only permits for hosts listed in
+        TrustedHosts:
 
             .\run-remote.ps1 -all -ensuretrustedhosts     # elevated console
             .\run-remote.ps1 -all -ensuretrustedhosts -restoretrustedhosts
@@ -51,7 +42,9 @@
     Public network profile, which limits WinRM to its own subnet. On the
     controller: Get-NetConnectionProfile, then Restart-Service NlaSvc -Force.
 
-    Results land in <LocalRoot>\<domain>\<date>\ on this machine.
+    Results land in <LocalRoot>\<domain>\<date>\ on this machine and are
+    never deleted - each dated folder is the baseline the next run compares
+    against.
 
     Collection runs on the controller, analysis runs here. That split
     matters: every analyzer compares the current run with the previous one,
@@ -83,34 +76,12 @@ param(
     [hashtable]$CredentialMap = @{},
     [switch]$PromptOnDenied,
 
-    # Encrypted credential store. Export-Clixml protects the password with
-    # DPAPI, so the file is readable only by this Windows account on this
-    # machine. Never put passwords in a plain .env next to a git repo.
-    [string]$CredentialStore = (Join-Path $env:USERPROFILE '.dc_actions\creds'),
-
-    # Optional plain file holding USERNAMES only, one per line:
-    #     xxx.lo = xxx\adm.olvin
-    #     ttt.lo = ttt\adm.olvin
-    # Used to prefill the prompt so the account never has to be retyped.
-    # No $PSScriptRoot-based default here: with [CmdletBinding()], PSScriptRoot
-    # is empty during param default evaluation when invoked via -File from an
-    # external process (confirmed PowerShell 5.1 quirk - this is exactly how a
-    # future web-triggered collection job would launch this script). Resolved
-    # in the script body instead, where PSScriptRoot is reliable.
-    [string]$EnvFile,
-
-    # Prompt for a credential, store it encrypted, then exit
-    [switch]$SetCredential,
-
     # Add the untrusted controllers to the WinRM TrustedHosts list so NTLM
     # can be used. Needs an elevated console. See the note near $Targets.
     [switch]$EnsureTrustedHosts,
 
     # Put TrustedHosts back the way it was once the run finishes
     [switch]$RestoreTrustedHosts,
-
-    # Do not read or write the store for this run
-    [switch]$NoCredentialStore,
 
     # Kerberos is the default and fails when the workstation sits in a
     # different domain from the target. Negotiate falls back to NTLM.
@@ -132,115 +103,57 @@ param(
     [switch]$OpenReport,
 
     # Where the report goes
-    [string]$ReportPath,
-
-    # Alternative target table, defaults to targets.psd1 beside the script
-    [string]$TargetsFile
+    [string]$ReportPath
 )
 
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-if (-not $EnvFile) { $EnvFile = Join-Path $here '.env' }
 
-# Output capture, report rendering and the SQL store live in their own
-# modules so this script stays about running things, not about formatting
-# or persisting them.
+# Output capture and report rendering live in their own modules so this
+# script stays about running things, not about formatting them.
 $script:CanReport = $true
-foreach ($mod in 'AuditCapture', 'AuditHtml', 'AuditDb') {
+foreach ($mod in 'AuditCapture', 'AuditHtml') {
     $modPath = Join-Path $here "$mod.psm1"
     if (Test-Path $modPath) { Import-Module $modPath -Force -DisableNameChecking }
-    elseif ($mod -eq 'AuditDb') {
-        Write-Warning "AuditDb.psm1 not found next to this script - continuing without SQL, CSV folders will be kept on disk"
-    }
     else {
         Write-Warning "$mod.psm1 not found next to this script - the HTML report will be skipped"
         $script:CanReport = $false
     }
 }
 
-# SQL is the durable store now (see AuditDb.psm1's header): a domain's
-# dated CSV folder is only deleted once its data has landed in the
-# database. If SQL is unreachable this whole run falls back to the old
-# behaviour instead - folders are kept on disk and the baseline comparison
-# scans them by date - rather than losing a day's collection to a database
-# hiccup.
-$script:CanUseDb = $false
-if (Get-Command Test-AuditDbConnection -ErrorAction SilentlyContinue) {
-    if (Test-AuditDbConnection) {
-        $script:CanUseDb = $true
-    }
-    else {
-        Write-Host ""
-        Write-Host "SQL Server unreachable - CSV folders will be kept on disk this run instead of loaded and deleted." -ForegroundColor Yellow
-        Write-Host "Run .\Initialize-AuditDatabase.ps1 to check the setup." -ForegroundColor Yellow
-    }
-}
-
 # ---------------------------------------------------------------
-# Credential handling
+# Credential handling - nothing is ever written to disk. Username comes
+# from the target's entry in $env:ADAUDIT_TARGETS (if given); the password
+# is always asked for interactively, once per domain per run.
 # ---------------------------------------------------------------
-function Get-CredentialPath {
-    param([string]$Dom)
-    $safe = $Dom -replace '[^\w\.\-]', '_'
-    return (Join-Path $CredentialStore "$safe.cred.xml")
-}
+function Resolve-DomainCredential {
+    <#
+        Order of precedence:
+          1. -CredentialMap entry for this domain
+          2. -Credential passed on the command line
+          3. interactive prompt, prefilled with the target's Username if
+             $env:ADAUDIT_TARGETS provided one
+    #>
+    param([string]$Dom, [string]$Server, [switch]$Interactive)
 
-function Import-StoredCredential {
-    param([string]$Dom)
-    if ($NoCredentialStore) { return $null }
-    $path = Get-CredentialPath $Dom
-    if (-not (Test-Path $path)) { return $null }
-    try {
-        # Import-Clixml only succeeds for the account that exported it
-        return Import-Clixml -Path $path
-    }
-    catch {
-        Write-Warning "Stored credential for $Dom is unusable: $($_.Exception.Message)"
-        Write-Warning "It was probably created by another account or on another machine."
-        return $null
-    }
-}
+    if ($CredentialMap.ContainsKey($Dom)) { return $CredentialMap[$Dom] }
+    if ($Credential) { return $Credential }
+    if (-not $Interactive) { return $null }
 
-function Save-StoredCredential {
-    param([string]$Dom, [System.Management.Automation.PSCredential]$Cred)
-    if ($NoCredentialStore) { return }
-    if (-not (Test-Path $CredentialStore)) {
-        New-Item -ItemType Directory -Path $CredentialStore -Force | Out-Null
-    }
-    $path = Get-CredentialPath $Dom
-    $Cred | Export-Clixml -Path $path -Force
-    Write-Host "  credential stored: $path" -ForegroundColor DarkGray
-}
-
-function Import-EnvUsernames {
-    # "domain = user" pairs, blank lines and # comments ignored
-    $map = @{}
-    if (-not $EnvFile -or -not (Test-Path $EnvFile)) { return $map }
-    foreach ($line in (Get-Content $EnvFile)) {
-        $t = "$line".Trim()
-        if (-not $t -or $t.StartsWith('#')) { continue }
-        $parts = $t -split '=', 2
-        if ($parts.Count -ne 2) { continue }
-        $k = $parts[0].Trim()
-        $v = $parts[1].Trim() -replace '^["'']|["'']$', ''
-        if ($k -and $v) { $map[$k] = $v }
-    }
-    return $map
-}
-
-$envUsers = Import-EnvUsernames
-if ($envUsers.Count) {
-    Write-Host "Loaded $($envUsers.Count) username hint(s) from $EnvFile" -ForegroundColor DarkGray
+    $hint = "$($Targets[$Dom].Username)"
+    $msg = "Credentials for $Dom ($Server)"
+    if ($hint) { return Get-Credential -Message $msg -UserName $hint }
+    return Get-Credential -Message $msg
 }
 
 # ---------------------------------------------------------------
 # TrustedHosts
 #
-# Without a trust, a workstation in core64.com cannot obtain a Kerberos
-# ticket for nnn.lo or ttt.lo. NTLM still works, but WinRM refuses NTLM
-# unless the target is listed in TrustedHosts. Listing a host means the
-# client stops verifying the server identity for that name, so keep the
-# list to specific names and never use a wildcard.
+# Without a trust, a workstation in the management domain cannot obtain a
+# Kerberos ticket for an untrusted domain. NTLM still works, but WinRM
+# refuses NTLM unless the target is listed in TrustedHosts. Listing a host
+# means the client stops verifying the server identity for that name, so
+# keep the list to specific names and never use a wildcard.
 # ---------------------------------------------------------------
 function Test-IsElevated {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -401,50 +314,6 @@ function New-TargetSession {
     return $null
 }
 
-function Resolve-DomainCredential {
-    <#
-        Order of precedence:
-          1. -CredentialMap entry for this domain
-          2. -Credential passed on the command line
-          3. cfg.DomainCredentials in SQL, when targets came from there
-             (see $script:TargetsFromDb) - the DB is authoritative once a
-             domain has been migrated into it, see Phase 1 of ROADMAP.md
-          4. the legacy per-domain DPAPI .cred.xml store
-          5. interactive prompt, only when -PromptOnDenied is set
-    #>
-    param([string]$Dom, [string]$Server, [switch]$Interactive)
-
-    if ($CredentialMap.ContainsKey($Dom)) { return $CredentialMap[$Dom] }
-    if ($Credential) { return $Credential }
-
-    if ($script:TargetsFromDb) {
-        try {
-            $dbCred = Get-DomainCredentialFromDb -Domain $Dom
-            if ($dbCred) {
-                Write-Host "  using DB-stored credential for $($dbCred.UserName)" -ForegroundColor DarkGray
-                return $dbCred
-            }
-        }
-        catch {
-            Write-Host "  could not read $Dom's credential from SQL, falling back to the local store: $($_.Exception.Message)" -ForegroundColor Yellow
-        }
-    }
-
-    $stored = Import-StoredCredential $Dom
-    if ($stored) {
-        Write-Host "  using stored credential for $($stored.UserName)" -ForegroundColor DarkGray
-        return $stored
-    }
-
-    if (-not $Interactive) { return $null }
-
-    $hint = if ($envUsers.ContainsKey($Dom)) { $envUsers[$Dom] } else { '' }
-    $msg = "Credentials for $Dom ($Server)"
-    $cred = if ($hint) { Get-Credential -Message $msg -UserName $hint } else { Get-Credential -Message $msg }
-    if ($cred) { Save-StoredCredential -Dom $Dom -Cred $cred }
-    return $cred
-}
-
 function Test-SessionAlive {
     param($Session)
     if (-not $Session) { return $false }
@@ -492,39 +361,19 @@ function Invoke-WithSession {
 }
 
 # ---------------------------------------------------------------
-# Target table - mirror of the one in deploy.ps1
-# ---------------------------------------------------------------
-# ---------------------------------------------------------------
-# Targets come from targets.psd1, shared with deploy.ps1 and
+# Targets come from $env:ADAUDIT_TARGETS, shared with deploy.ps1 and
 # Fix-NlaDependency.ps1. Trusted = $false marks the domains with no trust
 # to the management domain: Kerberos cannot work there, so those hosts need
 # NTLM and an entry in TrustedHosts.
 # ---------------------------------------------------------------
 $targetsModule = Join-Path $here 'AuditTargets.psm1'
 if (-not (Test-Path $targetsModule)) {
-    throw "AuditTargets.psm1 not found next to this script. It reads targets.psd1."
+    throw "AuditTargets.psm1 not found next to this script."
 }
 Import-Module $targetsModule -Force -DisableNameChecking
 
-# SQL (cfg.Targets/cfg.DomainCredentials, see ROADMAP.md Phase 1) is
-# authoritative and is tried first - targets.psd1 is retired (no longer
-# shipped by default) and is only consulted if SQL is unreachable or
-# empty, so Get-AuditTargets -Path (which throws when the file is
-# missing) must NOT run unconditionally before the DB is even checked.
-$script:TargetsFromDb = $false
-if ($script:CanUseDb) {
-    try {
-        $dbTargets = Get-AuditTargetsFromDb
-        if ($dbTargets.Count) {
-            $script:TargetsFromDb = $true
-            Write-Host "Targets: $($dbTargets.Count) domain(s) from SQL (cfg.Targets)" -ForegroundColor DarkGray
-        }
-    }
-    catch {
-        Write-Host "Could not read targets from SQL, falling back to targets.psd1: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
-}
-$Targets = if ($script:TargetsFromDb) { $dbTargets } else { Get-AuditTargets -Path $TargetsFile }
+$Targets = Get-AuditTargets
+Write-Host "Targets: $($Targets.Count) domain(s) from `$env:ADAUDIT_TARGETS" -ForegroundColor DarkGray
 
 if ($List) {
     Show-AuditTargets -Targets $Targets
@@ -536,43 +385,6 @@ foreach ($dom in $selected) {
     if (-not $Targets.Contains($dom)) {
         throw "Unknown domain '$dom'. Run .\run-remote.ps1 -list to see the table."
     }
-}
-
-# ---------------------------------------------------------------
-# Store credentials and exit
-# ---------------------------------------------------------------
-if ($SetCredential) {
-    foreach ($dom in $selected) {
-        $srv = $Targets[$dom].Server
-        Write-Host ""
-        Write-Host "--- $dom ($srv)" -ForegroundColor Cyan
-        $hint = if ($envUsers.ContainsKey($dom)) { $envUsers[$dom] } else { '' }
-        $c = if ($hint) {
-            Get-Credential -Message "Credentials for $dom ($srv)" -UserName $hint
-        }
-        else {
-            Get-Credential -Message "Credentials for $dom ($srv)"
-        }
-        if ($c) {
-            Save-StoredCredential -Dom $dom -Cred $c
-            # confirm the account actually works before trusting the file
-            $t = New-TargetSession -Server $srv -Cred $c -Method $Authentication
-            if ($t) {
-                Remove-PSSession $t
-                Write-Host "  verified against $srv" -ForegroundColor Green
-            }
-            else {
-                Write-Host "  saved, but the session failed:" -ForegroundColor Yellow
-                Write-Host "  $script:LastSessionError" -ForegroundColor DarkGray
-            }
-        }
-        else { Write-Host "  skipped" -ForegroundColor DarkGray }
-    }
-    Write-Host ""
-    Write-Host "Store: $CredentialStore" -ForegroundColor DarkGray
-    Write-Host "Readable only by $env:USERNAME on $env:COMPUTERNAME." -ForegroundColor DarkGray
-    Write-Host ""
-    return
 }
 
 $toolkits = if ($Only -contains 'all') { @('gpo', 'adhealth', 'adsecurity') } else { $Only }
@@ -638,8 +450,9 @@ foreach ($dom in $selected) {
     Write-Host ("--- $dom  ->  $server " + ('-' * [Math]::Max(0, 28 - $dom.Length))) -ForegroundColor Cyan
     if (-not $trusted) { Write-Host "  no trust with the management domain, using NTLM" -ForegroundColor DarkGray }
 
-    # map -> command line -> encrypted store; no prompt on the first attempt
-    $cred = Resolve-DomainCredential -Dom $dom -Server $server
+    # map -> command line -> interactive prompt (username prefilled from
+    # $env:ADAUDIT_TARGETS if it had one). Nothing is ever stored.
+    $cred = Resolve-DomainCredential -Dom $dom -Server $server -Interactive
 
     $status = 'ok'
     $detail = ''
@@ -662,16 +475,10 @@ foreach ($dom in $selected) {
 
     if (-not $session -and $PromptOnDenied) {
         Write-Host "  refused: $script:LastSessionError" -ForegroundColor DarkYellow
-        # A stored credential that no longer works is worse than none:
-        # drop it so the prompt is not skipped next time.
-        if ($cred -and -not $CredentialMap.ContainsKey($dom) -and -not $Credential) {
-            $stale = Get-CredentialPath $dom
-            if (Test-Path $stale) {
-                Remove-Item $stale -Force -ErrorAction SilentlyContinue
-                Write-Host "  removed the stored credential, it no longer works" -ForegroundColor DarkYellow
-            }
-        }
-        $cred = Resolve-DomainCredential -Dom $dom -Server $server -Interactive
+        Write-Host "  trying again with a different credential" -ForegroundColor DarkYellow
+        $hint = "$($Targets[$dom].Username)"
+        $msg = "Credentials for $dom ($server)"
+        $cred = if ($hint) { Get-Credential -Message $msg -UserName $hint } else { Get-Credential -Message $msg }
         if ($cred) { $session = New-TargetSession -Server $server -Cred $cred -Method $Authentication }
     }
 
@@ -694,7 +501,7 @@ foreach ($dom in $selected) {
             }
         }
         else {
-            Write-Host "  try: .\run-remote.ps1 -domain $dom -setcredential" -ForegroundColor DarkYellow
+            Write-Host "  try again with -promptondenied, or check the username/password" -ForegroundColor DarkYellow
         }
         $results.Add([PSCustomObject]@{
                 Domain = $dom; Server = $server; Status = 'no session'; Files = 0
@@ -862,46 +669,20 @@ foreach ($dom in $selected) {
                             })
                     }
                     else {
-                        # Baseline for the comparison: the previous run for
-                        # this domain, either looked up in SQL and pulled
-                        # back out as a throwaway CSV folder (Export-RunToCsvFolder,
-                        # byte-faithful to what the collector originally
-                        # wrote), or - when SQL is unreachable this run -
-                        # the previous dated folder still on disk, exactly
-                        # as before.
-                        $prevRunId = $null
-                        $prevDir = $null
+                        # Baseline for the comparison: the previous dated
+                        # folder for this domain, still on disk - folders
+                        # are never deleted, so this always exists once a
+                        # domain has been collected more than once.
+                        $prevDir = Get-ChildItem (Join-Path $LocalRoot $dom) -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' -and $_.Name -ne $today } |
+                        Sort-Object Name -Descending | Select-Object -First 1
+
                         $compareDir = $null
-                        $rehydrateDir = $null
-
-                        if ($script:CanUseDb) {
-                            try {
-                                $prevRun = Get-PreviousRunId -Domain $dom
-                                if ($prevRun) {
-                                    $prevRunId = $prevRun.RunId
-                                    $rehydrateDir = Join-Path $env:TEMP "audit-rehydrate\$dom\$($prevRun.RunId)"
-                                    if (Test-Path $rehydrateDir) { Remove-Item $rehydrateDir -Recurse -Force -ErrorAction SilentlyContinue }
-                                    Export-RunToCsvFolder -RunId $prevRun.RunId -Domain $dom -OutDir $rehydrateDir
-                                    $compareDir = $rehydrateDir
-                                    Write-Host ("  comparing against run {0} ({1:yyyy-MM-dd})" -f $prevRun.RunId, $prevRun.RunDate) -ForegroundColor DarkGray
-                                }
-                                else { Write-Host "  no earlier run to compare with" -ForegroundColor DarkGray }
-                            }
-                            catch {
-                                Write-Host "  could not rehydrate the previous run from SQL, comparing without a baseline: $($_.Exception.Message)" -ForegroundColor Yellow
-                            }
+                        if ($prevDir) {
+                            $compareDir = $prevDir.FullName
+                            Write-Host "  comparing against $($prevDir.Name)" -ForegroundColor DarkGray
                         }
-                        else {
-                            $prevDir = Get-ChildItem (Join-Path $LocalRoot $dom) -Directory -ErrorAction SilentlyContinue |
-                            Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' -and $_.Name -ne $today } |
-                            Sort-Object Name -Descending | Select-Object -First 1
-
-                            if ($prevDir) {
-                                $compareDir = $prevDir.FullName
-                                Write-Host "  comparing against $($prevDir.Name)" -ForegroundColor DarkGray
-                            }
-                            else { Write-Host "  no earlier run to compare with" -ForegroundColor DarkGray }
-                        }
+                        else { Write-Host "  no earlier run to compare with" -ForegroundColor DarkGray }
 
                         # Analyzer output is captured rather than printed:
                         # three reports across six domains is unreadable in a
@@ -987,40 +768,14 @@ foreach ($dom in $selected) {
                                 })
                         }
 
-                        # ---------------------------------------------------
-                        # Load this run into SQL. Only once that succeeds is
-                        # the local dated folder deleted (see AuditDb.psm1's
-                        # Save-AuditRun) - a failed load keeps the CSVs on
-                        # disk and the report falls back to reading them
-                        # directly, same as when SQL is unreachable entirely.
-                        # ---------------------------------------------------
-                        $runId = $null
-                        if ($script:CanUseDb) {
-                            try {
-                                $saved = Save-AuditRun -Domain $dom -Server $server `
-                                    -RunDate ([datetime]::ParseExact($today, 'yyyy-MM-dd', $null)) -DataPath $localDir
-                                $runId = $saved.RunId
-                                Write-Host "  saved to SQL as run $runId" -ForegroundColor DarkGray
-
-                                Remove-Item $localDir -Recurse -Force -ErrorAction SilentlyContinue
-                                Write-Host "  local CSVs removed, SQL is now the only copy" -ForegroundColor DarkGray
-                            }
-                            catch {
-                                Write-Host "  DB LOAD FAILED, CSVs kept at $localDir : $($_.Exception.Message)" -ForegroundColor Red
-                                $runId = $null
-                            }
-                        }
-                        if ($rehydrateDir -and (Test-Path $rehydrateDir)) {
-                            Remove-Item $rehydrateDir -Recurse -Force -ErrorAction SilentlyContinue
-                        }
-
+                        # No database: the dated CSV folder just collected
+                        # IS the persistent record, kept on disk forever as
+                        # the baseline for the next run.
                         $reportData.Add([PSCustomObject]@{
-                                Domain        = $dom
-                                DataPath      = $localDir
-                                BaselinePath  = $(if ($prevDir) { $prevDir.FullName } else { $null })
-                                RunId         = $runId
-                                PreviousRunId = $prevRunId
-                                Sections      = @($sections.ToArray())
+                                Domain       = $dom
+                                DataPath     = $localDir
+                                BaselinePath = $(if ($prevDir) { $prevDir.FullName } else { $null })
+                                Sections     = @($sections.ToArray())
                             })
                     }
                 }
