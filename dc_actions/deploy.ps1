@@ -2,8 +2,8 @@
     deploy.ps1
 
     Copies the audit toolkit to the domain controllers listed in
-    $env:ADAUDIT_TARGETS (see AuditTargets.psm1's header for the JSON
-    shape).
+    $env:ADAUDIT_TARGETS, or a .env file next to AuditTargets.psm1 if
+    that's not set (see that module's header for the JSON shape).
 
     Copying is done with robocopy /XO, so unchanged files are skipped and a
     file that is newer on the controller is never overwritten by an older
@@ -125,7 +125,7 @@ if (-not (Test-Path $targetsModule)) {
 Import-Module $targetsModule -Force -DisableNameChecking
 
 $Targets = Get-AuditTargets
-Write-Host "Targets: $($Targets.Count) domain(s) from `$env:ADAUDIT_TARGETS" -ForegroundColor DarkGray
+Write-Host "Targets: $($Targets.Count) domain(s)" -ForegroundColor DarkGray
 
 if ($List) {
     Show-AuditTargets -Targets $Targets

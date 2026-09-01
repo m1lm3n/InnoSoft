@@ -37,12 +37,12 @@ history if ever needed again.
       every domain in one run
 - [x] `Fix-NlaDependency.ps1` - one-off maintenance fix for a DC's network
       profile flapping to Public at boot
-- [x] Targets + usernames from `$env:ADAUDIT_TARGETS` (JSON array: Domain,
-      Server, Username, Trusted, Extra, Note per entry) - see
+- [x] Targets + usernames from `$env:ADAUDIT_TARGETS`, or a `.env` file next
+      to `AuditTargets.psm1` if that's not set (JSON array: Domain, Server,
+      Username, Trusted, Extra, Note per entry - copy `.env.example`) - see
       `AuditTargets.psm1`
 - [x] Passwords never stored anywhere - `Get-Credential` prompt per domain,
-      every run, prefilled with the Username from `$env:ADAUDIT_TARGETS` if
-      given
+      every run, prefilled with the Username from the target table if given
 - [x] CSV folders under `-LocalRoot` (`C:\audit\<domain>\<date>\` by
       default) kept on disk permanently - each one is the baseline the next
       run compares against
@@ -50,14 +50,15 @@ history if ever needed again.
 ## Usage
 
 ```powershell
-$env:ADAUDIT_TARGETS = '[
-  {"Domain":"a.lo","Server":"dc.a.lo","Username":"a\olvin","Trusted":true},
-  {"Domain":"nnn.lo","Server":"dc-nnn.nnn.lo","Username":"nnn\adm","Trusted":false,"Note":"no trust"}
-]'
+# one-time setup: copy dc_actions\.env.example to dc_actions\.env and fill
+# in your domains (JSON array - see AuditTargets.psm1's header)
 
 .\deploy.ps1 -all          # ship the toolkit to every DC
 .\run-remote.ps1 -all      # collect, analyze, build the report
 ```
+
+`.env` is read automatically if `$env:ADAUDIT_TARGETS` isn't set for the
+session - no need to set the env var by hand each time.
 
 ---
 

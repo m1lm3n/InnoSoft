@@ -9,9 +9,10 @@
     One-shot tool: nothing persists between runs except the CSV folders
     themselves (kept on disk under -LocalRoot as the baseline for the next
     run's comparison) and the HTML report. No database, no stored
-    credentials - targets and usernames come from $env:ADAUDIT_TARGETS
-    (see AuditTargets.psm1's header for the JSON shape), passwords are
-    asked for interactively every run.
+    credentials - targets and usernames come from $env:ADAUDIT_TARGETS or,
+    if that's not set, a .env file next to AuditTargets.psm1 (copy
+    .env.example - see that module's header for the JSON shape). Passwords
+    are asked for interactively every run, never stored.
 
     Usage:
         .\run-remote.ps1                       # default domain
@@ -373,7 +374,7 @@ if (-not (Test-Path $targetsModule)) {
 Import-Module $targetsModule -Force -DisableNameChecking
 
 $Targets = Get-AuditTargets
-Write-Host "Targets: $($Targets.Count) domain(s) from `$env:ADAUDIT_TARGETS" -ForegroundColor DarkGray
+Write-Host "Targets: $($Targets.Count) domain(s)" -ForegroundColor DarkGray
 
 if ($List) {
     Show-AuditTargets -Targets $Targets

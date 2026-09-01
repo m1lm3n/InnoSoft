@@ -1,17 +1,25 @@
 <#
     AuditTargets.psm1
 
-    Reads the target table from the ADAUDIT_TARGETS environment variable -
-    a JSON array, one object per domain - and hands back an ordered
-    dictionary keyed by domain name. No file, no database: this is a
-    one-shot tool, the caller sets ADAUDIT_TARGETS for the session and runs
-    the script.
+    Reads the target table - a JSON array, one object per domain - and
+    hands back an ordered dictionary keyed by domain name. No database:
+    this is a one-shot tool.
+
+    Source, in order:
+        1. $env:ADAUDIT_TARGETS, if already set for the session
+        2. a .env file next to this module (dc_actions\.env) - read once
+           per call, not cached, so editing it takes effect on the next run
+
+    .env may hold the JSON directly, or prefixed with `ADAUDIT_TARGETS=`
+    (either is fine, the prefix is just stripped if present). Being a real
+    file means no PowerShell string-quoting to fight - write the JSON as
+    plain, multi-line, pretty-printed text.
 
     Shape:
-        $env:ADAUDIT_TARGETS = '[
-          {"Domain":"a.lo","Server":"dc.a.lo","Username":"a\\olvin","Trusted":true},
-          {"Domain":"nnn.lo","Server":"dc-nnn.nnn.lo","Username":"nnn\\adm","Trusted":false,"Extra":["dc2.nnn.lo"],"Note":"no trust"}
-        ]'
+        [
+          {"Domain":"a.lo","Server":"dc.a.lo","Username":"a\olvin","Trusted":true},
+          {"Domain":"nnn.lo","Server":"dc-nnn.nnn.lo","Username":"nnn\adm","Trusted":false,"Extra":["dc2.nnn.lo"],"Note":"no trust"}
+        ]
 
     Fields per entry:
         Domain    required, the key
@@ -27,16 +35,35 @@
                   same domain
         Note      optional, defaults to '' - shown in -list
 
+    .env is gitignored - see .env.example for a template to copy.
+
     Usage
         Import-Module .\AuditTargets.psm1
         $Targets = Get-AuditTargets
         $Targets['nnn.lo'].Server
 #>
 
+function Get-TargetsRawJson {
+    if (-not [string]::IsNullOrWhiteSpace($env:ADAUDIT_TARGETS)) {
+        return $env:ADAUDIT_TARGETS
+    }
+
+    $envFile = Join-Path $PSScriptRoot '.env'
+    if (Test-Path $envFile) {
+        $text = (Get-Content $envFile -Raw).Trim()
+        # Accept either a bare JSON array or an `ADAUDIT_TARGETS=...` line.
+        $text = $text -replace '(?i)^ADAUDIT_TARGETS\s*=\s*', ''
+        if (-not [string]::IsNullOrWhiteSpace($text)) { return $text }
+    }
+
+    return $null
+}
+
 function Get-AuditTargets {
     <#
         .SYNOPSIS
-        Reads the target table from $env:ADAUDIT_TARGETS.
+        Reads the target table - $env:ADAUDIT_TARGETS if set, else .env
+        next to this module.
 
         .PARAMETER Domain
         Return only these domains, in the order given.
@@ -46,23 +73,22 @@ function Get-AuditTargets {
         [string[]]$Domain
     )
 
-    $raw = $env:ADAUDIT_TARGETS
+    $raw = Get-TargetsRawJson
     if ([string]::IsNullOrWhiteSpace($raw)) {
-        $example = '$env:ADAUDIT_TARGETS = ''[{"Domain":"a.lo","Server":"dc.a.lo","Username":"a\olvin"}]'''
-        throw "ADAUDIT_TARGETS is not set. Example: $example"
+        throw "No targets found. Either set `$env:ADAUDIT_TARGETS to a JSON array, or create a .env file next to this module (copy .env.example). See this module's header for the shape."
     }
 
     try { $parsed = $raw | ConvertFrom-Json -ErrorAction Stop }
-    catch { throw "ADAUDIT_TARGETS could not be parsed as JSON: $($_.Exception.Message)" }
+    catch { throw "Targets could not be parsed as JSON: $($_.Exception.Message)" }
 
     $entries = @($parsed)
-    if (-not $entries.Count) { throw "ADAUDIT_TARGETS parsed to an empty list" }
+    if (-not $entries.Count) { throw "Targets parsed to an empty list" }
 
     $ordered = [ordered]@{}
     foreach ($e in $entries) {
-        if (-not $e.Domain) { throw "ADAUDIT_TARGETS: an entry is missing 'Domain'" }
-        if (-not $e.Server) { throw "ADAUDIT_TARGETS: '$($e.Domain)' has no Server" }
-        if ($ordered.Contains($e.Domain)) { throw "ADAUDIT_TARGETS: duplicate domain '$($e.Domain)'" }
+        if (-not $e.Domain) { throw "An entry is missing 'Domain'" }
+        if (-not $e.Server) { throw "'$($e.Domain)' has no Server" }
+        if ($ordered.Contains($e.Domain)) { throw "Duplicate domain '$($e.Domain)'" }
 
         $ordered[$e.Domain] = @{
             Server   = $e.Server
@@ -93,8 +119,7 @@ function Show-AuditTargets {
         Prints the target table.
 
         .PARAMETER Targets
-        An already-loaded ordered dictionary to print, instead of reloading
-        from ADAUDIT_TARGETS.
+        An already-loaded ordered dictionary to print, instead of reloading.
     #>
     [CmdletBinding()]
     param($Targets)
