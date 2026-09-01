@@ -28,13 +28,14 @@
         domain from the controller. Override with -authentication if needed.
 
     Trusts:
-        Domains marked "Trusted": false in $env:ADAUDIT_TARGETS have no
-        trust to the management domain, so Kerberos cannot work there. They
-        need NTLM, which WinRM only permits for hosts listed in
-        TrustedHosts:
-
-            .\run-remote.ps1 -all -ensuretrustedhosts     # elevated console
-            .\run-remote.ps1 -all -ensuretrustedhosts -restoretrustedhosts
+        Domains marked "Trusted": false have no trust to the management
+        domain, so Kerberos cannot work there. They need NTLM, which WinRM
+        only permits for hosts listed in TrustedHosts - handled
+        automatically, no flag needed: missing entries are added before the
+        run starts, self-elevating via a single UAC prompt if this console
+        isn't already elevated. Entries persist across runs by design (the
+        normal case is running this repeatedly); pass -restoretrustedhosts
+        to put the list back the way it was afterwards instead.
 
         Recheck after any change to the trust layout:
             nltest /domain_trusts /all_trusts /v
@@ -77,11 +78,11 @@ param(
     [hashtable]$CredentialMap = @{},
     [switch]$PromptOnDenied,
 
-    # Add the untrusted controllers to the WinRM TrustedHosts list so NTLM
-    # can be used. Needs an elevated console. See the note near $Targets.
-    [switch]$EnsureTrustedHosts,
-
-    # Put TrustedHosts back the way it was once the run finishes
+    # Put TrustedHosts back the way it was once the run finishes - off by
+    # default, since the normal case is running this repeatedly and wanting
+    # the entries to stay. Untrusted controllers are added to TrustedHosts
+    # automatically whenever needed (self-elevating via a UAC prompt if this
+    # console isn't already elevated), no flag required.
     [switch]$RestoreTrustedHosts,
 
     # Kerberos is the default and fails when the workstation sits in a
@@ -223,18 +224,38 @@ function Add-TrustedHostEntry {
         return $true
     }
 
-    if (-not (Test-IsElevated)) {
-        Write-Host "  TrustedHosts needs an elevated console. Run once as administrator:" -ForegroundColor Yellow
-        Write-Host "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value '$($missing -join ',')' -Concatenate -Force" -ForegroundColor Yellow
-        return $false
-    }
+    $valueArg = ($missing -join ',')
 
-    try {
-        Set-Item WSMan:\localhost\Client\TrustedHosts -Value ($missing -join ',') -Concatenate -Force -ErrorAction Stop
+    if (Test-IsElevated) {
+        try {
+            Set-Item WSMan:\localhost\Client\TrustedHosts -Value $valueArg -Concatenate -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Host "  could not update TrustedHosts: $(($_.Exception.Message -split "`n")[0])" -ForegroundColor Red
+            return $false
+        }
     }
-    catch {
-        Write-Host "  could not update TrustedHosts: $(($_.Exception.Message -split "`n")[0])" -ForegroundColor Red
-        return $false
+    else {
+        # Not elevated - self-elevate for just this one command instead of
+        # requiring the caller to have started an elevated console. One UAC
+        # prompt, no separate manual step to remember.
+        Write-Host "  TrustedHosts needs elevation - requesting it now (UAC prompt)..." -ForegroundColor Yellow
+        $cmd = "Set-Item WSMan:\localhost\Client\TrustedHosts -Value '$valueArg' -Concatenate -Force"
+        try {
+            $p = Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -PassThru `
+                -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $cmd)
+            if ($p.ExitCode -ne 0) {
+                Write-Host "  elevated command exited $($p.ExitCode)" -ForegroundColor Red
+                return $false
+            }
+        }
+        catch {
+            # UAC declined, or elevation is unavailable/blocked entirely
+            Write-Host "  elevation was refused or unavailable: $(($_.Exception.Message -split "`n")[0])" -ForegroundColor Red
+            Write-Host "  add it by hand from an elevated console:" -ForegroundColor Yellow
+            Write-Host "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value '$valueArg' -Concatenate -Force" -ForegroundColor Yellow
+            return $false
+        }
     }
 
     # Confirm rather than assume: a silent failure here shows up much later
@@ -416,21 +437,8 @@ if ($needNtlm.Count) {
     Write-Host ""
     Write-Host "No trust with: $(@($selected | Where-Object { $Targets[$_].Trusted -eq $false }) -join ', ')" -ForegroundColor DarkYellow
     Write-Host "These need NTLM, which WinRM allows only for TrustedHosts entries." -ForegroundColor DarkYellow
-    if ($EnsureTrustedHosts) {
-        if (-not (Add-TrustedHostEntry -HostNames $needNtlm)) {
-            Write-Host "TrustedHosts could not be prepared - the untrusted domains will fail." -ForegroundColor Red
-        }
-    }
-    else {
-        $have = @()
-        if ($trustedHostsBefore) { $have = @($trustedHostsBefore -split ',' | ForEach-Object { $_.Trim() }) }
-        $missing = @($needNtlm | Where-Object { $have -notcontains $_ })
-        if ($missing.Count) {
-            Write-Host "Not listed yet: $($missing -join ', ')" -ForegroundColor DarkYellow
-            Write-Host "Add them with -ensuretrustedhosts from an elevated console," -ForegroundColor DarkYellow
-            Write-Host "or once by hand:" -ForegroundColor DarkYellow
-            Write-Host "  Set-Item WSMan:\localhost\Client\TrustedHosts -Value '$($missing -join ',')' -Concatenate -Force" -ForegroundColor DarkYellow
-        }
+    if (-not (Add-TrustedHostEntry -HostNames $needNtlm)) {
+        Write-Host "TrustedHosts could not be prepared - the untrusted domains will fail." -ForegroundColor Red
     }
 }
 
@@ -491,9 +499,10 @@ foreach ($dom in $selected) {
         if ("$script:LastSessionError" -match '0x80090311') {
             if (-not $trusted) {
                 Write-Host "  Expected: there is no trust with $dom, so Kerberos cannot work." -ForegroundColor DarkYellow
-                Write-Host "  NTLM needs this host in TrustedHosts. From an elevated console:" -ForegroundColor DarkYellow
+                Write-Host "  NTLM needs this host in TrustedHosts, which the automatic step above" -ForegroundColor DarkYellow
+                Write-Host "  could not set up (declined UAC prompt?). Add it by hand from an" -ForegroundColor DarkYellow
+                Write-Host "  elevated console:" -ForegroundColor DarkYellow
                 Write-Host "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value '$server' -Concatenate -Force" -ForegroundColor DarkYellow
-                Write-Host "  or rerun with -ensuretrustedhosts as administrator." -ForegroundColor DarkYellow
             }
             else {
                 Write-Host "  Kerberos found no KDC although a trust is expected. Verify it:" -ForegroundColor DarkYellow

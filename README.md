@@ -73,8 +73,12 @@ the file, or for CI-style invocation.
 .\run-remote.ps1 -all -only gpo # one toolkit across every domain
 .\run-remote.ps1 -list          # print the target table, do nothing else
 .\run-remote.ps1 -all -promptondenied        # retry interactively if a credential is refused
-.\run-remote.ps1 -all -ensuretrustedhosts    # elevated console; needed once for untrusted domains
 ```
+
+Untrusted domains (`Trusted: false`) need NTLM, which WinRM only permits
+for hosts listed in `TrustedHosts` - handled automatically, no flag needed:
+missing entries are added before the run starts, prompting once for UAC if
+the console isn't already elevated.
 
 `Get-Help .\run-remote.ps1` shows the parameter list; the fuller
 explanation (trusts, TrustedHosts, authentication fallback, output layout)
